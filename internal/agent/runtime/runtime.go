@@ -109,6 +109,7 @@ type Session struct {
 	toolPolicy        tools.Policy                                  // agent tool policy (toolsets allow/deny); zero = unrestricted
 	browserHeadless   bool                                          // gateway/service sessions run Chrome headless (no desktop)
 	noApprover        bool                                          // detached job: no human can answer approval prompts
+	denyCommands      []string                                      // capability ceiling: command patterns this run may never execute
 	adminMode         bool                                          // admin session (`memcode admin`): admin tools only, settings doctrine
 	adminExec         AdminExecutor                                 // cmd-injected admin operations (engine never imports the gateway layer)
 	iterCap           int                                           // per-session runLoop iteration override (0 = mode default); set on the bounded plan-review sub-session
@@ -734,6 +735,13 @@ func (s *Session) flushAllowNote() {
 // the command to actually run (the user may substitute a safer one), and a deny
 // reason for the model when refused.
 func (s *Session) gateCommand(ctx context.Context, risk permissions.Risk, catastrophic bool, command, cwd string) (bool, string, string) {
+	// CAPABILITY CEILING, checked before anything that could loosen it — before
+	// remembered approvals, before the recoverability downgrade, before the
+	// authorization judge. A denied command is not a risk judgement to be argued
+	// with; it is a power this run does not have. Nothing below may reverse it.
+	if matched, denied := permissions.DeniedBy(command, s.denyCommands); denied {
+		return false, command, "this run's capabilities do not include: " + matched
+	}
 	if _, ok := permissions.Match(s.approvals, command, cwd, catastrophic, time.Now()); ok {
 		// Permission provenance, TERSE: one word of trust signal, not a policy essay.
 		s.allowNote("pre-approved")

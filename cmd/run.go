@@ -193,6 +193,9 @@ for local gateway development. Never store keys in .memcode.`,
 		if ro, _ := cmd.Flags().GetBool("read-only"); ro {
 			sess.SetReadOnly(true)
 		}
+		if dc, _ := cmd.Flags().GetString("deny-commands"); dc != "" {
+			sess.SetDenyCommands(splitCSV(dc))
+		}
 		allowTools, _ := cmd.Flags().GetString("allow-tools")
 		denyTools, _ := cmd.Flags().GetString("deny-tools")
 		if allowTools != "" || denyTools != "" {
@@ -371,6 +374,8 @@ func init() {
 	_ = runCmd.Flags().MarkHidden("deny-tools")
 	runCmd.Flags().Bool("read-only", false, "internal: explorer mode — read-only tools only, no edits and no bash")
 	_ = runCmd.Flags().MarkHidden("read-only")
+	runCmd.Flags().String("deny-commands", "", "internal: comma-separated command patterns this run may never execute")
+	_ = runCmd.Flags().MarkHidden("deny-commands")
 	runCmd.Flags().String("model", "", "model for this run (a catalog label like sonnet or opus); overrides the remembered pin without changing it")
 	runCmd.Flags().String("browser-session", "", "internal: \"existing_chrome\" attaches this run to the user's own already-running Chrome via the gateway browser broker (fails closed, never falls back to ephemeral)")
 	_ = runCmd.Flags().MarkHidden("browser-session")

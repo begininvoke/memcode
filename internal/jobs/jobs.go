@@ -61,6 +61,16 @@ type SpawnSpec struct {
 	// text plainly asks for the action, and a task's instructions ALWAYS ask for
 	// the task's own work.
 	ReadOnly bool
+	// DenyCommands is the child's capability ceiling: shell command patterns it
+	// may never run. A REAL restriction on the child, like ToolPolicy — not
+	// recorded metadata.
+	DenyCommands []string
+	// WorkDir is where the child PROCESS runs, when that differs from Root.
+	// Root stays the project that owns the job's bookkeeping — its directory,
+	// meta and log — so a run executing in a disposable worktree does not write
+	// its own log somewhere that gets deleted when the worktree is cleaned up.
+	// Empty means "same as Root".
+	WorkDir string
 }
 
 type Job struct {
@@ -192,6 +202,9 @@ func SpawnWithSpec(spec SpawnSpec) (Job, error) {
 	if spec.ReadOnly {
 		argv = append(argv, "--read-only")
 	}
+	if len(spec.DenyCommands) > 0 {
+		argv = append(argv, "--deny-commands", strings.Join(spec.DenyCommands, ","))
+	}
 	if isTestBinary(self) {
 		// Under `go test`, os.Executable() is the package's TEST binary, not memcode.
 		// Re-execing it as `agent …` runs the caller's whole test suite again: the
@@ -204,6 +217,9 @@ func SpawnWithSpec(spec SpawnSpec) (Job, error) {
 	}
 	cmd := exec.Command(self, argv...)
 	cmd.Dir = root
+	if spec.WorkDir != "" {
+		cmd.Dir = spec.WorkDir // execute here; bookkeeping stays under Root
+	}
 	cmd.Stdout = logf
 	cmd.Stderr = logf
 	cmd.Stdin = nil

@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,6 +19,34 @@ import (
 const deadPID = 4194303
 
 var clock = time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+
+// repo makes a throwaway git repository with one commit. A mutating task runs
+// in an isolated worktree, which needs a repo with a HEAD — so a plain temp dir
+// is now correctly refused, and tests must reflect what real use looks like.
+func repo(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		c := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		c.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com")
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	run("init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "README.md")
+	run("commit", "-qm", "initial")
+	return dir
+}
 
 func store(t *testing.T) *Store {
 	t.Helper()
@@ -49,6 +79,19 @@ func runner(t *testing.T, s *Store, spawn SpawnFunc) *Runner {
 
 func ok(text string) SpawnFunc {
 	return func(context.Context, SpawnRequest) (SpawnResult, error) {
+		return SpawnResult{Text: text, LogPath: "/tmp/log"}, nil
+	}
+}
+
+// changing is an executor that actually edits the worktree. Needed for a
+// success outcome, because "did this run change anything" is read from the
+// REPOSITORY and not from what the agent claims — an agent that says it updated
+// four model ids and touched nothing is a no_change run, deliberately.
+func changing(text string) SpawnFunc {
+	return func(_ context.Context, req SpawnRequest) (SpawnResult, error) {
+		if err := os.WriteFile(filepath.Join(req.WorkDir, "changed.txt"), []byte("work\n"), 0o644); err != nil {
+			return SpawnResult{}, err
+		}
 		return SpawnResult{Text: text, LogPath: "/tmp/log"}, nil
 	}
 }
@@ -162,9 +205,9 @@ func TestEndToEndLoop(t *testing.T) {
 	s := store(t)
 	ctx := context.Background()
 	tk := sample(t, "")
-	r := runner(t, s, ok("Updated 4 model ids. Tests pass."))
+	r := runner(t, s, changing("Updated 4 model ids. Tests pass."))
 
-	run, err := r.Run(ctx, tk, t.TempDir(), TriggerManual, "")
+	run, err := r.Run(ctx, tk, repo(t), TriggerManual, "")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -200,11 +243,14 @@ func TestOutcomeClassification(t *testing.T) {
 		fn   SpawnFunc
 		want Outcome
 	}{
-		{"success", ok("Updated 4 model ids."), OutcomeSuccess},
+		{"success", changing("Updated 4 model ids."), OutcomeSuccess},
+		// The agent CLAIMS work but the repository is untouched: no_change wins,
+		// because the outcome is a fact and not a narration.
+		{"claimed but unchanged", ok("Updated 4 model ids."), OutcomeNoChange},
 		{"no change", ok("Checked every provider. No changes needed."), OutcomeNoChange},
-		{"needs attention", ok("Anthropic changed a contract; this needs your decision."), OutcomeNeedsAttention},
+		{"needs attention", changing("Anthropic changed a contract; this needs your decision."), OutcomeNeedsAttention},
 		// A run refused a capability did not do its job, however calm the prose.
-		{"denied capability", ok("I tried to write the file but the tool call was denied."), OutcomeNeedsAttention},
+		{"denied capability", changing("I tried to write the file but the tool call was denied."), OutcomeNeedsAttention},
 		{"executor error", func(context.Context, SpawnRequest) (SpawnResult, error) {
 			return SpawnResult{}, errors.New("spawn failed")
 		}, OutcomeFailed},
@@ -215,7 +261,7 @@ func TestOutcomeClassification(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			s := store(t)
-			run, err := runner(t, s, c.fn).Run(context.Background(), sample(t, ""), t.TempDir(), TriggerManual, "")
+			run, err := runner(t, s, c.fn).Run(context.Background(), sample(t, ""), repo(t), TriggerManual, "")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -234,7 +280,7 @@ func TestTimeoutFailsTheRun(t *testing.T) {
 		<-ctx.Done()
 		return SpawnResult{}, ctx.Err()
 	})
-	run, err := r.Run(context.Background(), tk, t.TempDir(), TriggerManual, "")
+	run, err := r.Run(context.Background(), tk, repo(t), TriggerManual, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,7 +401,7 @@ func TestSeenStateMachine(t *testing.T) {
 	s := store(t)
 	ctx := context.Background()
 	r := runner(t, s, ok("done"))
-	run, _ := r.Run(ctx, sample(t, ""), t.TempDir(), TriggerManual, "")
+	run, _ := r.Run(ctx, sample(t, ""), repo(t), TriggerManual, "")
 
 	if run.Seen != SeenUnseen {
 		t.Fatalf("seen = %q, want unseen", run.Seen)
@@ -395,16 +441,56 @@ func TestAuthorityShapesExecution(t *testing.T) {
 	if got := modeFor(ro); got != permissions.ModeAuto {
 		t.Errorf("mode = %q, want auto for every tier", got)
 	}
-	if !readOnlyFor(ro) {
-		t.Error("a read_only task must run with the read-only tool whitelist")
+	// Authority is a capability PROJECTION now: the tier decides which tools and
+	// command classes the child receives, and a read-only tier keeps its shell
+	// (a task that cannot build or test is not useful) while losing the tools
+	// and commands that could change anything that outlives the run.
+	cap, err := ro.Capability()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"edit_file", "apply_patch", "github"} {
+		if !contains(cap.DenyTools, want) {
+			t.Errorf("read_only must deny the %s tool, got %v", want, cap.DenyTools)
+		}
+	}
+	if contains(cap.DenyTools, "shell") {
+		t.Error("read_only must KEEP its shell — builds, tests and queries are the point")
+	}
+	for _, want := range []string{"git push", "git commit", "gh"} {
+		if !contains(cap.DenyCommands, want) {
+			t.Errorf("read_only must deny %q, got %v", want, cap.DenyCommands)
+		}
+	}
+	if !cap.ProtectProject {
+		t.Error("read_only must not execute in the user's checkout")
+	}
+	if cap.Mutating {
+		t.Error("read_only is not a mutating tier")
 	}
 
 	br := sample(t, "")
 	if got := modeFor(br); got != permissions.ModeAuto {
 		t.Errorf("branch mode = %q, want auto", got)
 	}
-	if readOnlyFor(br) {
-		t.Error("a branch task must keep its tools")
+	bcap, err := br.Capability()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bcap.DenyTools) != 0 {
+		t.Errorf("the branch tier keeps its tools, got denied %v", bcap.DenyTools)
+	}
+	if contains(bcap.DenyCommands, "git push") {
+		t.Error("the branch tier may push a new branch")
+	}
+	// But never the operations that make work authoritative, at any tier.
+	for _, want := range []string{"git push --force", "git merge", "gh pr merge"} {
+		if !contains(bcap.DenyCommands, want) {
+			t.Errorf("%q must be denied at every tier, got %v", want, bcap.DenyCommands)
+		}
+	}
+	if !bcap.Mutating {
+		t.Error("the branch tier is a mutating tier")
 	}
 }
 
@@ -418,25 +504,36 @@ func TestSpawnRequestCarriesFrozenInputs(t *testing.T) {
 		return SpawnResult{Text: "ok"}, nil
 	})
 	tk := sample(t, "version: 1\nname: audit\ninstructions: look only\nautonomy:\n  level: read_only\n")
-	run, err := rn.Run(context.Background(), tk, t.TempDir(), TriggerManual, "")
+	run, err := rn.Run(context.Background(), tk, repo(t), TriggerManual, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if seen.RunID != run.ID {
 		t.Errorf("RunID = %q, want %q", seen.RunID, run.ID)
 	}
-	if !seen.ReadOnly {
-		t.Error("the executor must be told a read_only task is read-only")
+	if !contains(seen.DenyTools, "edit_file") {
+		t.Errorf("the executor must receive the capability ceiling, got %v", seen.DenyTools)
+	}
+	if !contains(seen.DenyCommands, "git push") {
+		t.Errorf("the executor must receive the command ceiling, got %v", seen.DenyCommands)
+	}
+	// The run WORKS in an isolated worktree, never the user's checkout — but its
+	// bookkeeping stays with the project, so a log survives the worktree.
+	if seen.WorkDir == run.Project {
+		t.Error("the run must not execute in the project's own checkout")
+	}
+	if !strings.HasPrefix(seen.WorkDir, filepath.Join(run.Project, ".memcode", "worktrees")) {
+		t.Errorf("working dir = %q, want a worktree under the project", seen.WorkDir)
 	}
 	if seen.Project != run.Project {
-		t.Errorf("project = %q, want the frozen %q", seen.Project, run.Project)
+		t.Errorf("bookkeeping root = %q, want the project %q", seen.Project, run.Project)
 	}
 }
 
 func TestDisabledTaskRefused(t *testing.T) {
 	s := store(t)
 	tk := sample(t, "version: 1\nname: off\ninstructions: x\nenabled: false\n")
-	_, err := runner(t, s, ok("x")).Run(context.Background(), tk, t.TempDir(), TriggerManual, "")
+	_, err := runner(t, s, ok("x")).Run(context.Background(), tk, repo(t), TriggerManual, "")
 	if err == nil || !strings.Contains(err.Error(), "disabled") {
 		t.Errorf("err = %v, want a disabled-task refusal", err)
 	}
@@ -446,8 +543,9 @@ func TestRecentAndActive(t *testing.T) {
 	s := store(t)
 	ctx := context.Background()
 	r := runner(t, s, ok("done"))
+	root := repo(t)
 	for i := 0; i < 2; i++ {
-		if _, err := r.Run(ctx, sample(t, ""), t.TempDir(), TriggerManual, ""); err != nil {
+		if _, err := r.Run(ctx, sample(t, ""), root, TriggerManual, ""); err != nil {
 			t.Fatal(err)
 		}
 	}

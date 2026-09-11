@@ -165,7 +165,7 @@ func TestMemcodeDialectConstructedOnlyViaItsPackage(t *testing.T) {
 		t.Fatal(err)
 	}
 	dir := strings.TrimSpace(string(root))
-	out, _ := exec.Command("grep", "-rln", "--include=*.go", "Memcode: *true", dir).CombinedOutput()
+	out, _ := exec.Command("grep", grepArgs("Memcode: *true", dir)...).CombinedOutput()
 	for _, f := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		if f == "" || strings.HasSuffix(f, "_test.go") || strings.Contains(f, "/internal/providers/memcode/") {
 			continue
@@ -223,6 +223,20 @@ func TestModuleGofmt(t *testing.T) {
 //
 // If this fails, do not add an exception. Route the call through the pin
 // resolver, or use the session's pin.
+// srcOnly are the directories a source guard must never look inside. .memcode is
+// memcode's own local state, and since autonomous task runs keep their isolated
+// worktrees under .memcode/worktrees, a repo-wide grep without this finds a
+// SECOND copy of every file in the project and reports it as a second caller.
+var srcOnly = []string{
+	"--exclude-dir=.memcode", "--exclude-dir=.git",
+	"--exclude-dir=node_modules", "--exclude-dir=forks",
+}
+
+// grepArgs builds a source-only recursive grep.
+func grepArgs(extra ...string) []string {
+	return append(append([]string{"-rln", "--include=*.go"}, srcOnly...), extra...)
+}
+
 func TestOneModelAuthority(t *testing.T) {
 	cases := []struct {
 		call    string
@@ -232,7 +246,7 @@ func TestOneModelAuthority(t *testing.T) {
 		{"catalog.UtilityModel()", "internal/llm/resolve.go"},
 	}
 	for _, tc := range cases {
-		out, err := exec.Command("grep", "-rln", "--include=*.go", tc.call, "../..").Output()
+		out, err := exec.Command("grep", grepArgs(tc.call, "../..")...).Output()
 		if err != nil && len(out) == 0 {
 			t.Fatalf("grep for %s found nothing at all — has the call been renamed?", tc.call)
 		}
@@ -273,7 +287,7 @@ func TestPolicyIsUserAuthored(t *testing.T) {
 		"internal/agent/runtime/ui.go":         true, // SetPolicy at the cmd boundary
 	}
 	for _, call := range []string{"policy.SetField(", "policy.UnsetTarget(", "policy.Save("} {
-		out, _ := exec.Command("grep", "-rln", "--include=*.go", call, "../..").Output()
+		out, _ := exec.Command("grep", grepArgs(call, "../..")...).Output()
 		for _, f := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 			f = strings.TrimPrefix(strings.TrimSpace(f), "../../")
 			if f == "" || strings.HasSuffix(f, "_test.go") || allowed[f] {
@@ -294,8 +308,7 @@ func TestPolicyIsUserAuthored(t *testing.T) {
 // pattern could silently rewire which model runs — exactly the spookiness the
 // split exists to prevent.
 func TestPrefsCannotWritePolicy(t *testing.T) {
-	out, _ := exec.Command("grep", "-rln", "--include=*.go",
-		"memcode/internal/policy", "../prefs").Output()
+	out, _ := exec.Command("grep", grepArgs("memcode/internal/policy", "../prefs")...).Output()
 	for _, f := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		if strings.TrimSpace(f) == "" {
 			continue

@@ -11,6 +11,7 @@ import (
 	"github.com/memcode-ai/memcode/internal/agent/permissions"
 	"github.com/memcode-ai/memcode/internal/jobs"
 	"github.com/memcode-ai/memcode/internal/task"
+	"github.com/memcode-ai/memcode/internal/taskgit"
 )
 
 // Runner turns a task definition into a durable, executed Run.
@@ -37,11 +38,20 @@ type SpawnFunc func(ctx context.Context, req SpawnRequest) (SpawnResult, error)
 // SpawnRequest is everything the executor needs, taken from the FROZEN run
 // rather than from the task file, so a mid-run YAML edit cannot reach it.
 type SpawnRequest struct {
-	RunID        string
-	Project      string
+	RunID string
+	// Project is the repository that owns the run's bookkeeping — its job log
+	// outlives a disposable worktree because of this.
+	Project string
+	// WorkDir is where the work actually happens: the isolated worktree, or the
+	// project itself when there is nothing to isolate.
+	WorkDir      string
 	Instructions string
 	Mode         permissions.Mode
 	ReadOnly     bool
+	// DenyTools and DenyCommands are the capability ceiling, projected from the
+	// task's grants. Both are real restrictions on the child.
+	DenyTools    []string
+	DenyCommands []string
 	Timeout      time.Duration
 }
 
@@ -130,17 +140,6 @@ func FreezeAt(t task.Task, root, triggerKind, triggerID string, occurredAt, now 
 // child was never given cannot be argued for.
 func modeFor(task.Task) permissions.Mode { return permissions.ModeAuto }
 
-// readOnlyFor reports whether the child runs in explorer mode — the read-only
-// tool whitelist, no edits and no bash. Reusing the existing mechanism rather
-// than hand-listing tools to deny, because a hand-list silently stops covering
-// every tool added after it was written.
-//
-// Note this is currently STRICTER than the read_only tier's stated grants: it
-// also removes process.execute_readonly, so a read-only task cannot run `go
-// test` today. Honouring that grant needs per-grant command gating, which is
-// milestone 4. Too strict is the right direction to be wrong in.
-func readOnlyFor(t task.Task) bool { return t.ReadOnly() }
-
 // Start freezes, records and claims a run without executing it. Returns
 // ErrOccupied when the occurrence already belongs to another run.
 func (r *Runner) Start(ctx context.Context, t task.Task, root, triggerKind, triggerID string, now time.Time) (Run, error) {
@@ -199,24 +198,146 @@ func (r *Runner) Execute(ctx context.Context, run Run, t task.Task) (Run, error)
 		defer cancel()
 	}
 
-	res, err := r.Spawn(runCtx, SpawnRequest{
-		RunID:        run.ID,
-		Project:      run.Project,
-		Instructions: t.Instructions,
-		Mode:         modeFor(t),
-		ReadOnly:     readOnlyFor(t),
-		Timeout:      run.Timeout,
-	})
-	stopHB()
-
-	outcome, summary, detail := classify(res, err, runCtx)
-	if ferr := r.Store.Finish(ctx, run.ID, outcome, summary, detail, res.LogPath, time.Now()); ferr != nil {
+	res := r.execute(runCtx, ctx, run, t)
+	if ferr := r.Store.FinishResult(ctx, run.ID, res, time.Now()); ferr != nil {
 		return run, ferr
 	}
 	return r.Store.Get(ctx, run.ID)
 }
 
-// Run is the whole loop: freeze, record, claim, execute, persist.
+// execute is the phased body of a run: isolate, work, verify, classify.
+//
+//	isolate   a fresh worktree, so nothing touches the user's checkout
+//	work      the agent, with only the capabilities its grants project
+//	verify    the task's own checks, run by US and judged on exit codes
+//	classify  the outcome, derived from facts
+//
+// The phases are separate because their verdicts are separate. The agent can
+// complete cleanly and the tests can still fail; the run can be blocked before
+// the agent ever starts. Collapsing those into one signal loses exactly the
+// information a human needs when something goes wrong.
+// The return value is NAMED so the cleanup defer can clear the recorded
+// worktree path: removing the directory while still reporting where it was
+// would leave every successful run pointing at somewhere that does not exist.
+func (r *Runner) execute(runCtx, storeCtx context.Context, run Run, t task.Task) (res Result) {
+	res = Result{Outcome: OutcomeFailed, ExecStatus: ExecFailed, VerifyStatus: VerifySkipped}
+
+	cap, err := t.Capability()
+	if err != nil {
+		res.Summary, res.Detail = "capability projection failed", err.Error()
+		res.ExecStatus = ExecBlocked
+		res.Outcome = OutcomeBlocked
+		return res
+	}
+
+	// ISOLATE. Every autonomous run works somewhere that is not the user's
+	// checkout: a mutating one needs a branch to build on, and a read-only one
+	// still needs its test caches to land off the tree someone is sitting in.
+	dir := run.Project
+	var wt taskgit.Worktree
+	if cap.ProtectProject {
+		if !taskgit.IsRepo(storeCtx, run.Project) {
+			if cap.Mutating {
+				res.Summary = "project is not a git repository"
+				res.Detail = "A task that changes code runs in an isolated worktree, which needs git. " +
+					"Initialize the repository, or set autonomy.level: read_only."
+				res.ExecStatus, res.Outcome = ExecBlocked, OutcomeBlocked
+				return res
+			}
+			// Read-only work in a non-repo: nothing to isolate into, and nothing
+			// it is allowed to change anyway.
+		} else {
+			branch := taskgit.BranchName(t.Git.Branch, t.Name, run.ID, time.Now())
+			created, cerr := taskgit.Create(storeCtx, run.Project, branch)
+			if cerr != nil {
+				res.Summary = "could not isolate the run"
+				res.Detail = cerr.Error()
+				res.ExecStatus, res.Outcome = ExecBlocked, OutcomeBlocked
+				return res
+			}
+			wt = created
+			dir = wt.Path
+			res.Worktree, res.Branch, res.BaseRev = wt.Path, wt.Branch, wt.Base
+			res.ResultRev = wt.Base
+			// Cleanup is decided by the OUTCOME, at the end: a failed run's
+			// worktree is the evidence someone is about to ask for, and deleting
+			// it to stay tidy destroys it.
+			defer func() {
+				if res.Outcome == OutcomeSuccess || res.Outcome == OutcomeNoChange {
+					_ = taskgit.Remove(storeCtx, wt)
+					res.Worktree = ""
+				}
+			}()
+		}
+	}
+
+	// WORK.
+	spawn, serr := r.Spawn(runCtx, SpawnRequest{
+		RunID:        run.ID,
+		Project:      run.Project,
+		WorkDir:      dir,
+		Instructions: t.Instructions,
+		Mode:         modeFor(t),
+		ReadOnly:     false,
+		DenyTools:    cap.DenyTools,
+		DenyCommands: cap.DenyCommands,
+		Timeout:      run.Timeout,
+	})
+	res.LogPath = spawn.LogPath
+	switch {
+	case runCtx.Err() == context.DeadlineExceeded:
+		res.ExecStatus = ExecTimedOut
+		res.Summary, res.Detail = "timed out", "The run exceeded its limits.timeout and was stopped."
+	case serr != nil:
+		res.ExecStatus = ExecFailed
+		res.Summary, res.Detail = "the run could not complete", serr.Error()
+	case spawn.ExitCode != 0:
+		res.ExecStatus = ExecFailed
+		res.Summary, res.Detail = fmt.Sprintf("exited %d", spawn.ExitCode), clip(spawn.Text, 4000)
+	default:
+		res.ExecStatus = ExecCompleted
+		res.Summary, res.Detail = firstLine(spawn.Text), clip(spawn.Text, 4000)
+	}
+
+	// What actually changed is read from the REPOSITORY, not from the report.
+	if wt.Path != "" {
+		if rev, rerr := wt.Revision(storeCtx); rerr == nil {
+			res.ResultRev = rev
+		}
+		if ch, cerr := wt.Changed(storeCtx); cerr == nil {
+			res.Changed = ch
+		}
+	}
+
+	// VERIFY. Only if the agent got that far; verifying after a timeout tells
+	// nobody anything and costs a test suite.
+	if res.ExecStatus == ExecCompleted {
+		checks, status := Verify(runCtx, dir, t.Verify.Commands)
+		res.VerifyStatus = status
+		res.Checks = Summarize(checks)
+	}
+
+	// CLASSIFY, from facts. The agent's only entry point is raising
+	// needs_attention, which can make the verdict more cautious and never less.
+	res.Outcome = Decide(res.ExecStatus, res.VerifyStatus, res.Changed, mentionsNeedsAttention(spawn.Text))
+	if res.VerifyStatus == VerifyFail {
+		res.Summary = "verification failed"
+	}
+	if res.Checks != "" {
+		res.Detail = strings.TrimSpace(res.Detail + "\n\n" + res.Checks)
+	}
+	if res.Worktree != "" && !res.OKOutcome() {
+		res.Detail = strings.TrimSpace(res.Detail + "\n\nWorktree kept for inspection: " + res.Worktree)
+	}
+	return res
+}
+
+// OKOutcome reports whether the result is one nobody needs to look at.
+func (r Result) OKOutcome() bool {
+	return r.Outcome == OutcomeSuccess || r.Outcome == OutcomeNoChange
+}
+
+// Run is the whole loop: freeze, record, claim, execute, persist.// Run is the whole loop: freeze, record, claim, execute, persist.
 func (r *Runner) Run(ctx context.Context, t task.Task, root, triggerKind, triggerID string) (Run, error) {
 	run, err := r.Start(ctx, t, root, triggerKind, triggerID, time.Now())
 	if err != nil {
@@ -247,48 +368,14 @@ func (r *Runner) heartbeat(ctx context.Context, id, leaseKey string) {
 	}
 }
 
-// classify turns an executor result into an outcome. It is deliberately
-// conservative: anything it cannot read as a clean success is surfaced for a
-// human rather than quietly called done.
-func classify(res SpawnResult, err error, ctx context.Context) (Outcome, string, string) {
-	switch {
-	case ctx.Err() == context.DeadlineExceeded:
-		return OutcomeFailed, "timed out", "The run exceeded its limits.timeout and was stopped."
-	case err != nil:
-		return OutcomeFailed, "the run could not complete", err.Error()
-	case res.ExitCode != 0:
-		return OutcomeFailed, fmt.Sprintf("exited %d", res.ExitCode), clip(res.Text, 4000)
-	}
-	summary := firstLine(res.Text)
-	// The agent saying it changed nothing is a distinct, healthy result, and
-	// worth keeping separate from "did work".
-	if mentionsNoChange(res.Text) {
-		return OutcomeNoChange, summary, clip(res.Text, 4000)
-	}
-	if mentionsNeedsAttention(res.Text) {
-		return OutcomeNeedsAttention, summary, clip(res.Text, 4000)
-	}
-	return OutcomeSuccess, summary, clip(res.Text, 4000)
-}
-
-// These read the agent's own PROSE, which is a provisional heuristic and not a
-// reliable classifier — a run that was refused a capability reported it three
-// different ways across three attempts ("was denied", "is being denied", "the run was
-// blocked"), and chasing phrasings is a losing game. The real fix is a
-// structured verdict from the executor plus the verify commands, which is
-// milestone 4. Until then these err toward SURFACING: a false needs_attention
-// costs a glance, a false success hides a task that silently stopped working.
-func mentionsNoChange(s string) bool {
-	l := strings.ToLower(s)
-	for _, p := range []string{"no changes", "nothing to change", "nothing to do",
-		"already up to date", "no updates needed"} {
-		if strings.Contains(l, p) {
-			return true
-		}
-	}
-	return false
-}
-
+// mentionsNeedsAttention is the agent's ONE input into the verdict: it may raise
+// needs_attention, making the outcome more cautious. It has no path to lower
+// one — success and no_change are derived from execution status, verification
+// exit codes, and whether the repository actually changed.
+//
+// Reading prose at all is a compromise, kept deliberately narrow. Everything
+// that decides whether a run WORKED is now a fact; this only decides whether to
+// escalate something that already worked.
 func mentionsNeedsAttention(s string) bool {
 	l := strings.ToLower(s)
 	for _, p := range []string{"needs attention", "needs your", "requires a human",
@@ -319,21 +406,40 @@ func clip(s string, n int) string {
 	return s[:n] + "…"
 }
 
+// jobSpec builds the child's spawn spec. Split out and tested directly because
+// the real spawn path is the ONE part of a run that an injected fake executor
+// cannot cover — and a missing field here is invisible until it matters. It was:
+// WorkDir went unset for a while, so the child ran in the user's checkout and
+// the agent's file writes escaped the worktree while every test still passed.
+func jobSpec(req SpawnRequest, workDir string) jobs.SpawnSpec {
+	return jobs.SpawnSpec{
+		// Root owns the bookkeeping (job dir, meta, log) so a log outlives a
+		// disposable worktree; WorkDir is where the process actually runs, which
+		// is what keeps the agent's file writes inside the isolation.
+		Root:         req.Project,
+		WorkDir:      workDir,
+		Task:         req.Instructions,
+		Mode:         string(req.Mode),
+		RunID:        req.RunID,
+		ReadOnly:     req.ReadOnly,
+		ToolPolicy:   jobs.ToolPolicy{Disabled: req.DenyTools},
+		DenyCommands: req.DenyCommands,
+		ReportBack:   true,
+	}
+}
+
 // spawnJob runs the work as a detached memcode child and waits for it, reusing
 // the job machinery the gateway already drives (liveness by pid AND start-time
 // signature, a heartbeated meta.json, a durable log).
 func spawnJob(ctx context.Context, req SpawnRequest) (SpawnResult, error) {
-	if _, err := os.Stat(req.Project); err != nil {
-		return SpawnResult{}, fmt.Errorf("project %s is not reachable: %w", req.Project, err)
+	workDir := req.WorkDir
+	if workDir == "" {
+		workDir = req.Project
 	}
-	job, err := jobs.SpawnWithSpec(jobs.SpawnSpec{
-		Root:       req.Project,
-		Task:       req.Instructions,
-		Mode:       string(req.Mode),
-		RunID:      req.RunID,
-		ReadOnly:   req.ReadOnly,
-		ReportBack: true,
-	})
+	if _, err := os.Stat(workDir); err != nil {
+		return SpawnResult{}, fmt.Errorf("working directory %s is not reachable: %w", workDir, err)
+	}
+	job, err := jobs.SpawnWithSpec(jobSpec(req, workDir))
 	if err != nil {
 		return SpawnResult{}, err
 	}

@@ -182,7 +182,7 @@ triggers:
 func TestPollIsIdempotentAcrossRestart(t *testing.T) {
 	s := store(t)
 	ctx := context.Background()
-	root := t.TempDir()
+	root := repo(t)
 	tk := triggered(t, fmt.Sprintf(daily, "run_once"))
 	now := at(t, "2026-09-11T09:30:00Z")
 
@@ -337,7 +337,7 @@ func TestLeaseExpiresOnStaleHeartbeat(t *testing.T) {
 func TestBlockedRunIsRecorded(t *testing.T) {
 	s := store(t)
 	ctx := context.Background()
-	root := t.TempDir()
+	root := repo(t)
 	tk := sample(t, "")
 
 	r := runner(t, s, ok("should not run"))
@@ -371,10 +371,10 @@ func TestBlockedRunIsRecorded(t *testing.T) {
 func TestDowntimeRecoveryEndToEnd(t *testing.T) {
 	s := store(t)
 	ctx := context.Background()
-	root := t.TempDir()
+	root := repo(t)
 	tk := triggered(t, fmt.Sprintf(daily, "run_once"))
 
-	r := runner(t, s, ok("nightly work done"))
+	r := runner(t, s, changing("nightly work done"))
 	// Monday: the daemon is up and the task has run.
 	monday := at(t, "2026-09-07T02:00:30Z")
 	r.Poll(ctx, []task.Task{tk}, root, monday)
@@ -434,7 +434,7 @@ triggers:
   - every: 1h
 `)
 	r := runner(t, s, ok("no"))
-	res := r.Poll(ctx, []task.Task{manual, off}, t.TempDir(), time.Now())
+	res := r.Poll(ctx, []task.Task{manual, off}, repo(t), time.Now())
 	if len(res.Started) != 0 {
 		t.Errorf("poll started %d runs, want 0", len(res.Started))
 	}

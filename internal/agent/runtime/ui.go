@@ -201,6 +201,11 @@ func (s *Session) SetNoApprover(on bool) { s.noApprover = on }
 // cannot be reached at all.
 func (s *Session) SetReadOnly(on bool) { s.readOnly = on }
 
+// SetDenyCommands installs the run's capability ceiling: shell command patterns
+// it may never execute, whatever their risk and whoever approves them. Matched
+// against the parsed AST, so wrappers and compounds cannot smuggle one past.
+func (s *Session) SetDenyCommands(patterns []string) { s.denyCommands = patterns }
+
 // SetEffortOverride forces the per-turn thinking effort from the /effort command: "off",
 // "medium", or "high" pin it every turn; "auto" (or anything else) clears the override and
 // returns to the per-turn heuristic (effortForTurn). EffortOverride reports the current setting.

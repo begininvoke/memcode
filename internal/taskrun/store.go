@@ -122,6 +122,20 @@ type Run struct {
 	// Backlog counts occurrences dropped when this one was created.
 	Backlog int
 
+	// Execution and verification, kept separable from Outcome.
+	ExecStatus   ExecutionStatus
+	VerifyStatus VerificationStatus
+	Checks       string
+
+	// Where the work happened. BaseRev is resolved at EXECUTION time, so a
+	// recovered occurrence is honest about building on today's HEAD rather than
+	// implying the repository was frozen when it was due.
+	Worktree  string
+	Branch    string
+	BaseRev   string
+	ResultRev string
+	Changed   bool
+
 	Host string
 	PID  int
 
@@ -167,7 +181,20 @@ CREATE TABLE IF NOT EXISTS runs (
   -- A collapsed backlog that is invisible is indistinguishable from a scheduler
   -- that quietly stopped working.
   backlog       INTEGER NOT NULL DEFAULT 0,
-  occurred_at   TEXT NOT NULL DEFAULT ''
+  occurred_at   TEXT NOT NULL DEFAULT '',
+  -- Execution and verification are recorded SEPARATELY from the final outcome.
+  -- A run whose agent finished cleanly and whose tests then failed is an
+  -- execution success and a task failure; one enum cannot say that, and
+  -- debugging without the distinction is guesswork.
+  exec_status   TEXT NOT NULL DEFAULT '',
+  verify_status TEXT NOT NULL DEFAULT '',
+  checks        TEXT NOT NULL DEFAULT '',
+  -- Where the work happened and what it produced.
+  worktree      TEXT NOT NULL DEFAULT '',
+  branch        TEXT NOT NULL DEFAULT '',
+  base_rev      TEXT NOT NULL DEFAULT '',
+  result_rev    TEXT NOT NULL DEFAULT '',
+  changed       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS runs_by_task ON runs(task, started_at DESC);
 CREATE INDEX IF NOT EXISTS runs_by_seen ON runs(seen, started_at DESC);
@@ -233,6 +260,14 @@ func migrate(ctx context.Context, db *sql.DB) error {
 	for _, stmt := range []string{
 		`ALTER TABLE runs ADD COLUMN backlog INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE runs ADD COLUMN occurred_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE runs ADD COLUMN exec_status TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE runs ADD COLUMN verify_status TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE runs ADD COLUMN checks TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE runs ADD COLUMN worktree TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE runs ADD COLUMN branch TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE runs ADD COLUMN base_rev TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE runs ADD COLUMN result_rev TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE runs ADD COLUMN changed INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := db.ExecContext(ctx, stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migrating task ledger: %w", err)
@@ -340,6 +375,35 @@ func (s *Store) Heartbeat(ctx context.Context, id string, now time.Time) error {
 
 // Finish closes a run. Terminal and idempotent: a run already done stays as it
 // was, so a late finisher cannot overwrite an interrupted verdict.
+// Result is everything a finished run records beyond its outcome.
+type Result struct {
+	Outcome      Outcome
+	Summary      string
+	Detail       string
+	LogPath      string
+	ExecStatus   ExecutionStatus
+	VerifyStatus VerificationStatus
+	Checks       string
+	Worktree     string
+	Branch       string
+	BaseRev      string
+	ResultRev    string
+	Changed      bool
+}
+
+// FinishResult closes a run with its full structured verdict.
+func (s *Store) FinishResult(ctx context.Context, id string, r Result, now time.Time) error {
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE runs SET exec_status=?, verify_status=?, checks=?, worktree=?, branch=?,
+		                base_rev=?, result_rev=?, changed=?
+		WHERE id=? AND state<>?`,
+		string(r.ExecStatus), string(r.VerifyStatus), r.Checks, r.Worktree, r.Branch,
+		r.BaseRev, r.ResultRev, r.Changed, id, string(StateDone)); err != nil {
+		return err
+	}
+	return s.Finish(ctx, id, r.Outcome, r.Summary, r.Detail, r.LogPath, now)
+}
+
 func (s *Store) Finish(ctx context.Context, id string, outcome Outcome, summary, detail, logPath string, now time.Time) error {
 	// detail APPENDS: a note recorded before the run started (why this occurrence
 	// exists) must survive the outcome being written over the top of it.
@@ -479,7 +543,8 @@ func (s *Store) Reconcile(ctx context.Context, now time.Time) (int, error) {
 
 const cols = `id, task, revision, definition, trigger_kind, trigger_id, project, grants,
 	provider, model, timeout_ns, max_cost_usd, state, outcome, summary, detail, log_path,
-	host, pid, started_at, heartbeat_at, finished_at, seen, backlog, occurred_at`
+	host, pid, started_at, heartbeat_at, finished_at, seen, backlog, occurred_at,
+	exec_status, verify_status, checks, worktree, branch, base_rev, result_rev, changed`
 
 func (s *Store) query(ctx context.Context, q string, args ...any) ([]Run, error) {
 	rows, err := s.db.QueryContext(ctx, q, args...)
@@ -495,7 +560,9 @@ func (s *Store) query(ctx context.Context, q string, args ...any) ([]Run, error)
 		if err := rows.Scan(&r.ID, &r.Task, &r.Revision, &r.Definition, &r.TriggerKind, &r.TriggerID,
 			&r.Project, &grants, &r.Provider, &r.Model, &timeoutNS, &r.MaxCostUSD, &r.State,
 			&r.Outcome, &r.Summary, &r.Detail, &r.LogPath, &r.Host, &r.PID,
-			&started, &heartbeat, &finished, &r.Seen, &r.Backlog, &occurred); err != nil {
+			&started, &heartbeat, &finished, &r.Seen, &r.Backlog, &occurred,
+			&r.ExecStatus, &r.VerifyStatus, &r.Checks, &r.Worktree, &r.Branch,
+			&r.BaseRev, &r.ResultRev, &r.Changed); err != nil {
 			return nil, err
 		}
 		if grants != "" {
