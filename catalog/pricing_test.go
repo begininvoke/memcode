@@ -24,9 +24,15 @@ func TestModelPricingRealIDs(t *testing.T) {
 		{"accounts/fireworks/models/glm-5p2", 1.40, 4.40}, // was $0
 		{"accounts/fireworks/models/glm-5p1", 1.40, 4.40},
 		{"accounts/fireworks/models/kimi-k3", 3.00, 15.00}, // K3's own Fireworks headline card ($3/$15), NOT the kimi family rule
-		{"accounts/fireworks/models/qwen3p8-2p4t-a95b", 2.00, 6.00},
+		{"accounts/fireworks/models/qwen3p8-max", 2.00, 6.00},
+		{"accounts/fireworks/models/qwen3p8-2p4t-a95b", 2.00, 6.00}, // legacy path
 		{"accounts/fireworks/models/deepseek-v4-pro-0813", 1.32, 3.96},
+		{"accounts/fireworks/models/deepseek-v4p1-flash", 0.22, 0.66},
+		// Superseded but still deployed on Fireworks: without its own rate row this
+		// falls to the $1.40/$4.40 Fireworks floor and bills 6x.
 		{"accounts/fireworks/models/deepseek-v4-flash-0731", 0.22, 0.66},
+		{"accounts/fireworks/models/glm-5p3", 1.40, 4.40},
+		{"accounts/fireworks/models/glm-5p3-flash", 0.15, 0.50},
 		{"claude-opus-5", 5, 25},   // $5/$25 since Opus 4.5 repricing
 		{"claude-fable-5", 10, 50}, // Fable 5 flagship $10/$50 (explicit entry price)
 		{"claude-sonnet-5", 2, 10}, // explicit sonnet rule (was falling to $3/$15 defaults)
@@ -79,12 +85,15 @@ func TestContextWindowFireworks(t *testing.T) {
 		want int
 	}{
 		{"accounts/fireworks/models/glm-5p2", 1_000_000}, // was defaulting to 200K
-		{"accounts/fireworks/models/glm-5p1", 202_000},
 		{"accounts/fireworks/models/kimi-k3", 1_000_000}, // k3 ≠ the kimi-k2 262K case
 		{"accounts/fireworks/models/kimi-k3", 1_000_000},
-		{"accounts/fireworks/models/qwen3p8-2p4t-a95b", 262_144},
-		{"accounts/fireworks/models/deepseek-v4-pro-0813", 1_040_000},
-		{"accounts/fireworks/models/deepseek-v4-flash-0731", 1_040_000},
+		{"accounts/fireworks/models/qwen3p8-max", 262_144},
+		{"accounts/fireworks/models/qwen3p8-2p4t-a95b", 262_144}, // legacy path, still deployed
+		{"accounts/fireworks/models/glm-5p3", 1_048_576},
+		{"accounts/fireworks/models/glm-5p3-flash", 1_048_576},
+		{"accounts/fireworks/models/deepseek-v4p1-flash", 1_048_576},
+		{"accounts/fireworks/models/deepseek-v4-pro-0813", 1_048_576},
+		{"accounts/fireworks/models/deepseek-v4-flash-0731", 1_048_576},
 		{"gemini-3.1-pro-preview", 1_000_000},
 		{"gemini-3.8-flash", 1_000_000},
 	}
@@ -108,7 +117,12 @@ func TestModelPricingCacheRates(t *testing.T) {
 		{"gpt-5.6-terra", 0.2, 2.5},
 		{"accounts/fireworks/models/glm-5p2", 0.14, 1.75},
 		{"accounts/fireworks/models/kimi-k3", 0.30, 3.75},
-		{"accounts/fireworks/models/qwen3p8-2p4t-a95b", 0.2, 2.5},
+		// Qwen 3.8 Max publishes $0.25 cached, NOT the 0.1x default this used to inherit.
+		{"accounts/fireworks/models/qwen3p8-max", 0.25, 2.5},
+		{"accounts/fireworks/models/qwen3p8-2p4t-a95b", 0.25, 2.5}, // legacy path prices the same
+		{"accounts/fireworks/models/glm-5p3", 0.26, 1.75},
+		{"accounts/fireworks/models/glm-5p3-flash", 0.03, 0.1875},
+		{"accounts/fireworks/models/deepseek-v4p1-flash", 0.007, 0.275},
 		{"accounts/fireworks/models/deepseek-v4-pro-0813", 0.044, 1.32 * 1.25},
 		{"accounts/fireworks/models/deepseek-v4-flash-0731", 0.007, 0.275},
 		{"gpt-image-2", 0.8, 10},

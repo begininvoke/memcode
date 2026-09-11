@@ -312,39 +312,94 @@
       ]
     },
     {
-      "id": "accounts/fireworks/models/glm-5p2",
-      "label": "glm-5p2",
+      "id": "accounts/fireworks/models/glm-5p3",
+      "label": "glm-5p3",
       "vendor": "fireworks",
-      "window": 1000000,
+      "window": 1048576,
       "vision": false,
       "reasoning": true,
-      "_note": "GLM-5.2 (Z.ai, Fireworks 2026-06-17): successor to 5.1, built for agentic SWE + long-horizon tool use; 1M context, function-calling, no vision. Same price as 5.1 ($1.40/$4.40/$0.26). PLANNER + cheap lane. Beats 5.1 across coding benches (SWE-bench Pro 62.1 vs 58.4, Terminal-Bench 81 vs 63.5); still below Opus 5 on the hardest (fine \u2014 Opus is escalation-only). Verified id resolves on the account via a live completion probe (not in /models listing \u2014 normal for serverless). Rollback: point roles back at glm-5p1 + redeploy.",
+      "price_in": 1.4,
+      "price_out": 4.4,
+      "price_cache_read": 0.26,
+      "_note": "GLM-5.3 (Z.ai, Fireworks 2026-08-28). Supersedes GLM-5.2 as the pinnable GLM and as the Fireworks intra-lane fallback target. 743B params, 1M context, 131,072 max output, function calling, no vision; gains over 5.2 are post-training only. Official Standard-tier rate verified on the Fireworks model page 2026-09-11: $1.40 in / $0.26 cached / $4.40 out. Same headline price as 5.2, but the cached rate is nearly double, so it is declared explicitly.",
       "pinnable": true,
       "group": "GLM",
       "desc": "Open-weight coding flagship",
-      "name": "GLM-5.2",
+      "name": "GLM-5.3",
       "www": {
         "chat": true,
         "order": 30,
-        "description": "Open-weight coding flagship (Z.ai) with a 1M context window \u2014 the same cheap lane the memcode CLI runs on."
+        "description": "Open-weight coding flagship (Z.ai) with a 1M context window, tuned for long-horizon agentic coding."
       },
-      "max_output": 32000,
+      "max_output": 131072,
       "fallback": [
         "terra",
         "luna"
       ]
     },
     {
-      "id": "accounts/fireworks/models/qwen3p8-2p4t-a95b",
+      "id": "accounts/fireworks/models/glm-5p3-flash",
+      "label": "glm-5p3-flash",
+      "vendor": "fireworks",
+      "window": 1048576,
+      "vision": true,
+      "reasoning": true,
+      "price_in": 0.15,
+      "price_out": 0.5,
+      "price_cache_read": 0.03,
+      "_note": "GLM-5.3 Flash (Z.ai, Fireworks 2026-08-26). The cheap tier of the 5.3 family: 1M context, function calling, and vision, at $0.15 in / $0.03 cached / $0.50 out (Fireworks serverless pricing table, verified 2026-09-11). Roughly a tenth of GLM-5.3's rate.",
+      "pinnable": true,
+      "group": "GLM",
+      "desc": "Cheap 1M-context coding",
+      "name": "GLM-5.3 Flash",
+      "www": {
+        "chat": true,
+        "order": 31,
+        "description": "Z.ai's GLM-5.3 Flash: a low-cost 1M-context model with vision, for routine coding work."
+      },
+      "max_output": 131072,
+      "fallback": [
+        "luna",
+        "glm-5p3"
+      ]
+    },
+    {
+      "id": "accounts/fireworks/models/glm-5p2",
+      "label": "glm-5p2",
+      "vendor": "fireworks",
+      "window": 1000000,
+      "vision": false,
+      "reasoning": true,
+      "_note": "GLM-5.2 (Z.ai, Fireworks 2026-06-17). SUPERSEDED by glm-5p3 2026-09-11 and demoted out of the pickers; still deployed on Fireworks, so the entry stays for anyone already pinned to it and to keep its metering exact. Official rate 2026-09-11: $1.40 / $0.14 cached / $4.40 \u2014 now declared here rather than inherited from the family floor. 1M context, function calling, no vision.",
+      "pinnable": false,
+      "group": "GLM",
+      "desc": "Open-weight coding flagship",
+      "name": "GLM-5.2",
+      "www": {
+        "chat": false,
+        "order": 30,
+        "description": "Open-weight coding flagship (Z.ai) with a 1M context window \u2014 the same cheap lane the memcode CLI runs on."
+      },
+      "max_output": 32000,
+      "fallback": [
+        "terra",
+        "glm-5p3"
+      ],
+      "price_in": 1.4,
+      "price_out": 4.4,
+      "price_cache_read": 0.14
+    },
+    {
+      "id": "accounts/fireworks/models/qwen3p8-max",
       "label": "qwen3p8-max",
       "vendor": "fireworks",
       "window": 262144,
-      "vision": false,
+      "vision": true,
       "reasoning": true,
       "price_in": 2.0,
       "price_out": 6.0,
-      "price_cache_read": 0.2,
-      "_note": "Qwen3.8-2.4T-A95B (Alibaba, Fireworks). Added 2026-08-26 after Fireworks model page showed Ready with path accounts/fireworks/models/qwen3p8-2p4t-a95b, 262144 context, $2/$6 per 1M. Pin-only + web chat initially; not a routing role until live-probed on memcode agent workloads.",
+      "price_cache_read": 0.25,
+      "_note": "Qwen3.8 Max (Alibaba, Fireworks). Repointed 2026-09-11 from accounts/fireworks/models/qwen3p8-2p4t-a95b to accounts/fireworks/models/qwen3p8-max. The label and the rate card here were already Qwen 3.8 Max, but qwen3p8-max is the id Fireworks lists and prices under that name, and it reports image input where the old path did not. Official rate verified 2026-09-11: $2.00 in, $0.25 cached, $6.00 out. The cached rate was 0.20, which underbilled cache reads by 20%.",
       "pinnable": true,
       "group": "Qwen",
       "desc": "Alibaba frontier coding",
@@ -357,7 +412,7 @@
       "max_output": 32000,
       "fallback": [
         "terra",
-        "glm-5p2"
+        "glm-5p3"
       ]
     },
     {
@@ -383,7 +438,7 @@
       "max_output": 32000,
       "fallback": [
         "terra",
-        "glm-5p2"
+        "glm-5p3"
       ]
     },
     {
@@ -398,30 +453,17 @@
       "_note": "OpenAI gpt-oss-120b (open-weight, Fireworks serverless). CLASSIFY role 2026-06-21: the cheap structured-output classifier for the followup-fold queue + plan-intent + risk/authorize judges. LIVE-PROBED against glm-5p2 on a followup-fold battery: gpt-oss-120b 10/10 @1.6-2.6s; glm-5p2 only 7/10 (biased to 'false' \u2192 under-folds) at ~10x the token cost. Forces tools cleanly (tool_choice). price ~$0.15/$0.60 per M (approx). The cheap CODING lane stays glm-5p2; this is classify-only. Rollback: drop config.json roles.classify (falls back to the cheap lane) + redeploy.",
       "fallback": [
         "luna",
-        "glm-5p2"
-      ]
-    },
-    {
-      "id": "accounts/fireworks/models/glm-5p1",
-      "label": "glm-5p1",
-      "vendor": "fireworks",
-      "window": 202000,
-      "vision": false,
-      "reasoning": true,
-      "_note": "GLM-5.1 (Z.ai): prior planner + cheap lane, SUPERSEDED by glm-5p2 2026-06-17. Kept as the instant rollback target. Function-calling, 202K, no vision. Fallback id accounts/fireworks/models/glm-5.",
-      "fallback": [
-        "terra",
-        "glm-5p2"
+        "glm-5p3"
       ]
     },
     {
       "id": "accounts/fireworks/models/deepseek-v4-pro-0813",
       "label": "deepseek-v4-pro",
       "vendor": "fireworks",
-      "window": 1040000,
+      "window": 1048576,
       "vision": false,
       "reasoning": true,
-      "_note": "DeepSeek V4 Pro 0813 (Fireworks official release, supersedes the earlier deepseek-v4-pro preview). Updated 2026-08-26 after Fireworks model page showed serverless Ready with path accounts/fireworks/models/deepseek-v4-pro-0813, 1,040K context, function calling, $1.32/$3.96 per 1M, cached input $0.044. Label stays deepseek-v4-pro so existing pins keep following the latest Pro release.",
+      "_note": "DeepSeek V4 Pro 0813 (Fireworks official release, supersedes the earlier deepseek-v4-pro preview). Updated 2026-08-26 after Fireworks model page showed serverless Ready with path accounts/fireworks/models/deepseek-v4-pro-0813, 1,048,576 context (the value Fireworks /models reports; the entry previously said 1,040,000), function calling, $1.32/$3.96 per 1M, cached input $0.044. Label stays deepseek-v4-pro so existing pins keep following the latest Pro release.",
       "pinnable": true,
       "group": "DeepSeek",
       "desc": "Open-weight reasoning",
@@ -434,33 +476,33 @@
       "max_output": 32000,
       "fallback": [
         "terra",
-        "glm-5p2"
+        "glm-5p3"
       ],
       "price_in": 1.32,
       "price_out": 3.96,
       "price_cache_read": 0.044
     },
     {
-      "id": "accounts/fireworks/models/deepseek-v4-flash-0731",
+      "id": "accounts/fireworks/models/deepseek-v4p1-flash",
       "label": "deepseek-v4-flash",
       "vendor": "fireworks",
-      "window": 1040000,
-      "vision": false,
+      "window": 1048576,
+      "vision": true,
       "reasoning": true,
-      "_note": "DeepSeek V4 Flash 0731 (Fireworks serverless). Added 2026-08-26 after Fireworks model page showed serverless Ready with path accounts/fireworks/models/deepseek-v4-flash-0731, 1,040K context, function calling, $0.22/$0.66 per 1M, cached input $0.007. Pin-only + web chat initially; not a routing role until live-probed on memcode agent workloads.",
+      "_note": "DeepSeek V4.1 Flash (Fireworks serverless, 2026-09-10). Supersedes deepseek-v4-flash-0731. 1M context, function calling, and vision, which 0731 did not have. Price is unchanged from 0731 and verified on the Fireworks model page 2026-09-11: $0.22 in, $0.007 cached, $0.66 out.",
       "pinnable": true,
       "group": "DeepSeek",
       "desc": "Fast reasoning",
-      "name": "DeepSeek V4 Flash",
+      "name": "DeepSeek V4.1 Flash",
       "www": {
         "chat": true,
         "order": 26,
-        "description": "DeepSeek's fast V4 Flash model for lower-cost reasoning and coding with a 1.04M context window."
+        "description": "DeepSeek's V4.1 Flash on Fireworks: fast, low-cost reasoning and coding with vision and a 1M context window."
       },
       "max_output": 32000,
       "fallback": [
         "luna",
-        "glm-5p2"
+        "glm-5p3"
       ],
       "price_in": 0.22,
       "price_out": 0.66,
@@ -476,11 +518,11 @@
       "_note": "RETIRED from roles 2026-06-13 \u2014 recurring tool-call-text leak (opencode #30684 + cross-harness) + weak instruction-following. Kept for reference; not assigned to any role. PRICING verified 2026-08-15 fireworks.ai model page: $0.30/$1.20, cached $0.059 (was billing the glm-family fallback $1.40/$4.40).",
       "fallback": [
         "luna",
-        "glm-5p2"
+        "glm-5p3"
       ],
       "price_in": 0.3,
       "price_out": 1.2,
-      "price_cache_read": 0.059
+      "price_cache_read": 0.06
     },
     {
       "id": "gemini-embedding-001",
@@ -598,15 +640,10 @@
     {
       "match": [
         "glm-5p2",
+        "glm-5p3",
         "deepseek-v4"
       ],
-      "window": 1040000
-    },
-    {
-      "match": [
-        "glm-5p1"
-      ],
-      "window": 202000
+      "window": 1048576
     },
     {
       "match": [
@@ -640,6 +677,41 @@
       "price_in": 0.95,
       "price_out": 4.0,
       "price_cache_read": 0.16
+    },
+    {
+      "match": [
+        "deepseek-v4-flash"
+      ],
+      "price_in": 0.22,
+      "price_out": 0.66,
+      "price_cache_read": 0.007,
+      "_note": "Legacy deepseek-v4-flash-0731, superseded by deepseek-v4p1-flash but still deployed and still pinnable. Without this row it falls to the Fireworks floor and bills 6x its real rate. Does not match deepseek-v4p1-flash."
+    },
+    {
+      "match": [
+        "qwen3p8",
+        "qwen3.8"
+      ],
+      "price_in": 2.0,
+      "price_out": 6.0,
+      "price_cache_read": 0.25,
+      "_note": "Qwen 3.8 Max rate, covering the legacy qwen3p8-2p4t-a95b path as well as the qwen3p8-max id."
+    },
+    {
+      "match": [
+        "glm-5p3-flash"
+      ],
+      "price_in": 0.15,
+      "price_out": 0.5,
+      "price_cache_read": 0.03
+    },
+    {
+      "match": [
+        "glm-5p3"
+      ],
+      "price_in": 1.4,
+      "price_out": 4.4,
+      "price_cache_read": 0.26
     },
     {
       "match": [
