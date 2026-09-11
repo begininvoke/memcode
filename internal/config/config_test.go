@@ -368,3 +368,64 @@ func TestResolveFindsProjectBelowHome(t *testing.T) {
 		t.Errorf("Resolve = %q (%s), want %q (%s)", root, src, proj, SourceExisting)
 	}
 }
+
+// A task carries real authority (it can edit a worktree, push a branch, open a
+// PR), so it is reviewable code rather than local state: .memcode ignores
+// itself, but tasks/ is carved back out and must be visible to git.
+func TestEnsureGitignoreExposesTasks(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, DirName, "tasks"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	EnsureGitignore(root)
+	b, err := os.ReadFile(filepath.Join(root, DirName, ".gitignore"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(b)
+	// Both lines are required: !tasks/ alone leaves the contents matching `*`.
+	for _, want := range []string{"*\n", "!tasks/\n", "!tasks/**\n"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("gitignore missing %q, got:\n%s", want, got)
+		}
+	}
+}
+
+// Migrating our own earlier templates is fine; overwriting something the user
+// wrote is not.
+func TestEnsureGitignoreMigratesOnlyOurTemplates(t *testing.T) {
+	write := func(root, body string) string {
+		t.Helper()
+		dir := filepath.Join(root, DirName)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		p := filepath.Join(dir, ".gitignore")
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	for _, prior := range []string{
+		"# memcode's local state — not part of your repo\n*\n",
+		"# memcode's local state — not part of your repo\n*\n!.gitignore\n",
+	} {
+		root := t.TempDir()
+		p := write(root, prior)
+		EnsureGitignore(root)
+		b, _ := os.ReadFile(p)
+		if !strings.Contains(string(b), "!tasks/") {
+			t.Errorf("our own template should migrate, got:\n%s", b)
+		}
+	}
+
+	root := t.TempDir()
+	const userEdited = "*\n!my-own-thing\n"
+	p := write(root, userEdited)
+	EnsureGitignore(root)
+	b, _ := os.ReadFile(p)
+	if string(b) != userEdited {
+		t.Errorf("a user-edited gitignore must be left alone, got:\n%s", b)
+	}
+}

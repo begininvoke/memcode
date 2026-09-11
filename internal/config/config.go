@@ -240,16 +240,43 @@ func Init(root string, force bool) (created bool, err error) {
 // would still show in `git status`; memcode re-creates this file every run, so it
 // never needs to be committed.
 //
+// The ONE exception is tasks/. An autonomous task is not local state — it is a
+// standing instruction with real authority (it can edit a worktree, push a
+// branch, open a PR), and a team should review a change to one the same way
+// they review any other code. So tasks/ is carved back out of the ignore-all
+// and IS meant to be committed. Re-including a path under a bare `*` takes both
+// lines: `!tasks/` so git will descend into the directory at all, and
+// `!tasks/**` so the files inside it stop matching `*`.
+//
 // PUBLIC and called on EVERY launch (openProject), not just first-time Init — an
 // already-initialized project still needs the self-ignore. Idempotent; no-op if
-// .memcode doesn't exist yet; never clobbers a user-edited file; and migrates our own
-// earlier `*`+`!.gitignore` template that didn't hide the dir.
+// .memcode doesn't exist yet; never clobbers a user-edited file; and migrates any
+// template memcode itself wrote to the current one.
 func EnsureGitignore(root string) {
 	gi := filepath.Join(root, DirName, ".gitignore")
-	const content = "# memcode's local state — not part of your repo\n*\n"
-	const priorTemplate = "# memcode's local state — not part of your repo\n*\n!.gitignore\n"
-	if b, err := os.ReadFile(gi); err == nil && string(b) != priorTemplate {
-		return // exists and isn't our migratable template — leave it alone
+	const content = "# memcode's local state — not part of your repo\n*\n" +
+		"# ...except autonomous tasks, which are meant to be reviewed and committed\n!tasks/\n!tasks/**\n"
+	// Every template memcode has ever written. A file matching one of these is
+	// ours to upgrade; anything else is the user's and stays untouched.
+	priorTemplates := []string{
+		"# memcode's local state — not part of your repo\n*\n!.gitignore\n",
+		"# memcode's local state — not part of your repo\n*\n",
+	}
+	if b, err := os.ReadFile(gi); err == nil {
+		cur := string(b)
+		if cur == content {
+			return // already current
+		}
+		ours := false
+		for _, t := range priorTemplates {
+			if cur == t {
+				ours = true
+				break
+			}
+		}
+		if !ours {
+			return // user-edited — leave it alone
+		}
 	}
 	_ = os.WriteFile(gi, []byte(content), 0o644)
 }

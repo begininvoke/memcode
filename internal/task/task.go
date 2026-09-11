@@ -1,0 +1,377 @@
+// Package task is memcode's autonomous Task: a reusable, declarative,
+// auditable unit of work the agent can execute with no human present.
+//
+// A Task is NOT inherently recurring. It is a runnable object first —
+// `memcode task run <name>` is a first-class entry point, not a testing
+// affordance — and a trigger is an optional attachment. That ordering is the
+// whole point: cron is one way a Task becomes eligible, never what a Task is.
+//
+// Three objects stay deliberately separate:
+//
+//	Task     what to do, how, with what authority   (YAML, hashable)
+//	Trigger  when it becomes eligible               (0..n, optional)
+//	Run      one immutable execution                (a DB row, package taskrun)
+//
+// Every run records the Revision of the definition that produced it, so
+// "why did this task push that branch?" stays answerable after the YAML has
+// been edited five times. The autonomy package hashes delegation policies for
+// the same reason and by the same method (see autonomy.CanonicalPolicy).
+package task
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"sort"
+	"strings"
+	"time"
+)
+
+// Version is the schema version every task file must declare. An explicit
+// version on a user-editable file is what lets the format change later without
+// guessing at the shape of what is on disk.
+const Version = 1
+
+// Scope says where a definition was loaded from. Project scope wins over global
+// on a name collision: a repo that ships its own task means it for that repo.
+type Scope string
+
+const (
+	ScopeProject Scope = "project"
+	ScopeGlobal  Scope = "global"
+)
+
+// Task is one task definition, as authored in YAML plus the resolved facts the
+// loader attaches. Zero-value fields are filled by ApplyDefaults before
+// validation or hashing, so a sparse file and its fully-written equivalent
+// produce the same Revision.
+type Task struct {
+	Version      int         `yaml:"version" json:"version"`
+	Name         string      `yaml:"name" json:"name"`
+	Description  string      `yaml:"description,omitempty" json:"description,omitempty"`
+	Enabled      *bool       `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Project      string      `yaml:"project,omitempty" json:"project,omitempty"`
+	Triggers     []Trigger   `yaml:"triggers,omitempty" json:"triggers,omitempty"`
+	Instructions string      `yaml:"instructions" json:"instructions"`
+	Execution    Execution   `yaml:"execution,omitempty" json:"execution"`
+	Agent        Agent       `yaml:"agent,omitempty" json:"agent"`
+	Autonomy     Autonomy    `yaml:"autonomy,omitempty" json:"autonomy"`
+	Git          Git         `yaml:"git,omitempty" json:"git"`
+	Verify       Verify      `yaml:"verify,omitempty" json:"verify"`
+	Delivery     Delivery    `yaml:"delivery,omitempty" json:"delivery"`
+	Limits       Limits      `yaml:"limits,omitempty" json:"limits"`
+	Concurrency  Concurrency `yaml:"concurrency,omitempty" json:"concurrency"`
+
+	// Resolved by the loader, never authored and never hashed.
+	Path  string `yaml:"-" json:"-"`
+	Scope Scope  `yaml:"-" json:"-"`
+}
+
+// Trigger is one way a task becomes eligible to run. Exactly one kind may be
+// set. The list is plural from day one so adding a second kind later is not a
+// schema migration; only the time forms and manual are implemented today.
+type Trigger struct {
+	Cron  string `yaml:"cron,omitempty" json:"cron,omitempty"`
+	Every string `yaml:"every,omitempty" json:"every,omitempty"`
+	At    string `yaml:"at,omitempty" json:"at,omitempty"`
+	// TZ evaluates Cron in a named zone ("America/Los_Angeles"); empty = local.
+	TZ string `yaml:"tz,omitempty" json:"tz,omitempty"`
+	// Missed decides what happens when the daemon was not running at the moment
+	// this trigger was due. Meaningless for Manual.
+	Missed Missed `yaml:"missed,omitempty" json:"missed,omitempty"`
+	// Manual is an explicit "this trigger only fires by hand". A task with no
+	// triggers at all is already manual-only; this exists so a file can say so.
+	Manual bool `yaml:"manual,omitempty" json:"manual,omitempty"`
+
+	// Reserved kinds. Declared so an author who writes one gets a clear "not
+	// implemented yet" instead of an unknown-field parse error, and so the
+	// schema slot is taken.
+	OnPush  *OnPush  `yaml:"on_push,omitempty" json:"on_push,omitempty"`
+	Webhook *Webhook `yaml:"webhook,omitempty" json:"webhook,omitempty"`
+}
+
+// OnPush and Webhook are reserved trigger kinds, rejected by Validate today.
+type OnPush struct {
+	Branch string `yaml:"branch,omitempty" json:"branch,omitempty"`
+}
+type Webhook struct {
+	Secret string `yaml:"secret,omitempty" json:"secret,omitempty"`
+}
+
+// Missed is the catch-up policy for a trigger the daemon slept through. This
+// matters more than it looks on a laptop: without it, "0 2 * * *" silently
+// means "only if the machine happened to be awake at 2am", and a weekly job can
+// go months without running while appearing healthy.
+type Missed string
+
+const (
+	// MissedRunOnce runs the task once on the next daemon start, then resumes
+	// the normal cadence. The default, and the right answer for maintenance.
+	MissedRunOnce Missed = "run_once"
+	// MissedSkip forgets the occurrence entirely (the old schedule behaviour).
+	MissedSkip Missed = "skip"
+	// MissedCatchUp replays every missed occurrence. Rarely what anyone wants.
+	MissedCatchUp Missed = "catch_up"
+)
+
+// Mode is how the task's work gets done.
+type Mode string
+
+const (
+	// ModeAgent reasons through the whole task every run.
+	ModeAgent Mode = "agent"
+	// ModeProcedure runs a learned deterministic procedure and nothing else.
+	ModeProcedure Mode = "procedure"
+	// ModeHybrid runs the procedure first and escalates to the agent only when
+	// the procedure reports there is something to think about. This is the
+	// difference between a 40k-token Monday and a free one.
+	ModeHybrid Mode = "hybrid"
+)
+
+// Execution selects the work strategy. Procedure names an entry in the repo's
+// procedure store; the concept is deliberately not "shell script", because a
+// procedure may later be an HTTP call, a tool sequence or a Go helper.
+type Execution struct {
+	Mode      Mode   `yaml:"mode,omitempty" json:"mode,omitempty"`
+	Procedure string `yaml:"procedure,omitempty" json:"procedure,omitempty"`
+	// EscalateWhen gates the agent half of a hybrid run.
+	EscalateWhen string `yaml:"escalate_when,omitempty" json:"escalate_when,omitempty"`
+}
+
+// EscalateOnChanges is the only escalation condition implemented today.
+const EscalateOnChanges = "procedure_reports_changes"
+
+// Agent selects the EXECUTION BACKEND, not merely a model endpoint. A Codex or
+// Claude Code subscription can be an agent runtime whose operational behaviour
+// differs from the same vendor's raw API, so this is a provider choice with a
+// model inside it rather than a bare model name.
+type Agent struct {
+	Provider string `yaml:"provider,omitempty" json:"provider,omitempty"`
+	Model    string `yaml:"model,omitempty" json:"model,omitempty"`
+}
+
+// ProviderSubscriptionPreferred picks the cheapest AUTHORIZED subscription
+// backend. Authorized, never merely present: a login living in another tool's
+// files is not consent to spend it unattended (see provider.credsource).
+const (
+	ProviderSubscriptionPreferred = "subscription-preferred"
+	ProviderMemcode               = "memcode"
+	ModelAuto                     = "auto"
+)
+
+// Autonomy is the task's authority CEILING. Level is a friendly preset that
+// expands to concrete grants; Grants adds named capabilities on top. The policy
+// engine only ever reasons about grants.
+//
+// A ceiling is not an override. Nothing written here can lift a task above
+// memcode's hard floor — permissions.Decide still returns NeedPrompt for a
+// catastrophic command in every mode, and an unknown grant is refused at parse
+// time rather than interpreted generously.
+type Autonomy struct {
+	Level  Level   `yaml:"level,omitempty" json:"level,omitempty"`
+	Grants []Grant `yaml:"grants,omitempty" json:"grants,omitempty"`
+}
+
+// PRMode decides whether a task that changed code opens a pull request.
+type PRMode string
+
+const (
+	PRNever       PRMode = "never"
+	PRWhenChanges PRMode = "when_changes"
+	PRAlways      PRMode = "always"
+)
+
+// Git controls how code changes leave an unattended run. Worktree isolation is
+// the default because an autonomous run must never disturb the branch a human
+// is sitting on.
+type Git struct {
+	Worktree    *bool  `yaml:"worktree,omitempty" json:"worktree,omitempty"`
+	PullRequest PRMode `yaml:"pull_request,omitempty" json:"pull_request,omitempty"`
+	Branch      string `yaml:"branch,omitempty" json:"branch,omitempty"`
+}
+
+// DefaultBranchPattern names the branch an autonomous run pushes. {name} and
+// {date} are substituted; the auto/ prefix makes provenance obvious in a branch
+// list.
+const DefaultBranchPattern = "auto/{name}-{date}"
+
+// Verify is how a run proves it succeeded. Without it "the agent stopped" gets
+// mistaken for "the task worked", which is how autonomous systems quietly rot.
+type Verify struct {
+	Commands []string `yaml:"commands,omitempty" json:"commands,omitempty"`
+}
+
+// Notify says when an optional sink fires.
+type Notify string
+
+const (
+	NotifyNever    Notify = "never"
+	NotifyFailures Notify = "failures"
+	NotifyChanges  Notify = "changes"
+	NotifyAlways   Notify = "always"
+)
+
+// Delivery is where results go. The inbox is the durable ledger and is always
+// on; everything else is notification layered over it.
+type Delivery struct {
+	Desktop Notify `yaml:"desktop,omitempty" json:"desktop,omitempty"`
+	// Channel reuses the gateway's existing "channel:conversation" address when
+	// the user has one paired. Empty means inbox only.
+	Channel   string `yaml:"channel,omitempty" json:"channel,omitempty"`
+	ChannelOn Notify `yaml:"channel_on,omitempty" json:"channel_on,omitempty"`
+}
+
+// Limits bound a single run. An unattended task that can spin forever is a
+// bill, not a feature.
+type Limits struct {
+	Timeout    string  `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+	MaxCostUSD float64 `yaml:"max_cost_usd,omitempty" json:"max_cost_usd,omitempty"`
+}
+
+// DefaultTimeout bounds a run that does not set its own.
+const DefaultTimeout = "45m"
+
+// ConcurrencyPolicy decides what happens when a task is due while an
+// overlapping run is still going.
+type ConcurrencyPolicy string
+
+const (
+	// ConcurrencyQueue waits for the in-flight run. The default: two tasks
+	// rewriting the same repo at once is a merge conflict with extra steps.
+	ConcurrencyQueue ConcurrencyPolicy = "queue"
+	// ConcurrencySkip drops this occurrence.
+	ConcurrencySkip ConcurrencyPolicy = "skip"
+)
+
+// Concurrency serializes runs that share a key. Key "project" (the default)
+// resolves to the task's project root, so every mutating task in a repo takes
+// the same lock while read-only tasks run freely.
+type Concurrency struct {
+	Key    string            `yaml:"key,omitempty" json:"key,omitempty"`
+	Policy ConcurrencyPolicy `yaml:"policy,omitempty" json:"policy,omitempty"`
+}
+
+// ConcurrencyKeyProject is the default key: one mutating run per repo.
+const ConcurrencyKeyProject = "project"
+
+// IsEnabled reports whether the task may run. Absent means enabled — a file
+// someone wrote is meant to work.
+func (t Task) IsEnabled() bool { return t.Enabled == nil || *t.Enabled }
+
+// UsesWorktree reports whether runs get an isolated worktree. Absent means yes.
+func (t Task) UsesWorktree() bool { return t.Git.Worktree == nil || *t.Git.Worktree }
+
+// Manual reports whether the task only ever runs by hand. A task with no
+// triggers is manual — that is a normal, complete task, not an unfinished one.
+func (t Task) Manual() bool {
+	for _, tr := range t.Triggers {
+		if !tr.Manual {
+			return false
+		}
+	}
+	return true
+}
+
+// ReadOnly reports whether this task may change anything at all.
+func (t Task) ReadOnly() bool { return t.Autonomy.Level == LevelReadOnly }
+
+// Timeout resolves the run bound.
+func (t Task) Timeout() time.Duration {
+	d, err := time.ParseDuration(t.Limits.Timeout)
+	if err != nil || d <= 0 {
+		d, _ = time.ParseDuration(DefaultTimeout)
+	}
+	return d
+}
+
+// ApplyDefaults fills every unset field with its documented default. It runs
+// before validation and before hashing, so a sparse file and the fully-written
+// equivalent are the same task with the same Revision.
+func (t *Task) ApplyDefaults() {
+	if t.Version == 0 {
+		t.Version = Version
+	}
+	t.Name = strings.TrimSpace(t.Name)
+	t.Instructions = strings.TrimSpace(t.Instructions)
+	if t.Enabled == nil {
+		on := true
+		t.Enabled = &on
+	}
+	if t.Execution.Mode == "" {
+		t.Execution.Mode = ModeAgent
+	}
+	if t.Execution.Mode == ModeHybrid && t.Execution.EscalateWhen == "" {
+		t.Execution.EscalateWhen = EscalateOnChanges
+	}
+	if t.Agent.Provider == "" {
+		t.Agent.Provider = ProviderSubscriptionPreferred
+	}
+	if t.Agent.Model == "" {
+		t.Agent.Model = ModelAuto
+	}
+	if t.Autonomy.Level == "" {
+		t.Autonomy.Level = LevelBranch
+	}
+	if t.Git.Worktree == nil {
+		// A read-only task changes nothing, so there is nothing to isolate.
+		on := t.Autonomy.Level != LevelReadOnly
+		t.Git.Worktree = &on
+	}
+	if t.Git.PullRequest == "" {
+		// Normalize the UNSET case only. An author who explicitly asked for a PR
+		// from a read-only task gets told it contradicts (see validateGit) rather
+		// than having their line quietly rewritten — silently narrowing stated
+		// intent is the same misleading failure as silently widening it.
+		if t.Autonomy.Level == LevelReadOnly {
+			t.Git.PullRequest = PRNever
+		} else {
+			t.Git.PullRequest = PRWhenChanges
+		}
+	}
+	if t.Git.Branch == "" {
+		t.Git.Branch = DefaultBranchPattern
+	}
+	if t.Delivery.Desktop == "" {
+		t.Delivery.Desktop = NotifyFailures
+	}
+	if t.Delivery.Channel != "" && t.Delivery.ChannelOn == "" {
+		t.Delivery.ChannelOn = NotifyAlways
+	}
+	if t.Limits.Timeout == "" {
+		t.Limits.Timeout = DefaultTimeout
+	}
+	if t.Concurrency.Key == "" {
+		t.Concurrency.Key = ConcurrencyKeyProject
+	}
+	if t.Concurrency.Policy == "" {
+		t.Concurrency.Policy = ConcurrencyQueue
+	}
+	for i := range t.Triggers {
+		if t.Triggers[i].Missed == "" && !t.Triggers[i].Manual {
+			t.Triggers[i].Missed = MissedRunOnce
+		}
+	}
+}
+
+// Revision is the content hash of the normalized definition: sha256 over
+// canonical JSON, sorted where order carries no meaning. Two files that differ
+// only in key order or in omitted-but-defaulted fields hash identically; any
+// semantic edit changes the hash.
+//
+// Every run records this. It is what makes an execution auditable months later,
+// after the YAML has moved on.
+func (t Task) Revision() (string, error) {
+	n := t
+	n.ApplyDefaults()
+	n.Path, n.Scope = "", ""
+	// Grants are a set. Verify.Commands and Triggers are sequences whose order
+	// the user chose, so they are left alone.
+	n.Autonomy.Grants = append([]Grant(nil), n.Autonomy.Grants...)
+	sort.Slice(n.Autonomy.Grants, func(i, j int) bool { return n.Autonomy.Grants[i] < n.Autonomy.Grants[j] })
+	b, err := json.Marshal(n)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(b)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
