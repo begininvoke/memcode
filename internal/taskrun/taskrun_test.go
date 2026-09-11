@@ -2,6 +2,7 @@ package taskrun
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -467,4 +468,73 @@ func contains(hay []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// A ledger created before a column existed must migrate, not explode. Every
+// other test here uses a fresh database, which is exactly why this one builds
+// the OLD shape by hand: the first version of the milestone-3 schema passed the
+// whole suite and then failed on the real ~/.config/memcode/tasks.db, because
+// CREATE TABLE IF NOT EXISTS silently skips an existing table.
+func TestOpenMigratesAnOlderLedger(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "tasks.db")
+
+	old, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The milestone-2 shape: no backlog, no occurred_at.
+	if _, err := old.ExecContext(ctx, `
+		CREATE TABLE runs (
+		  id TEXT PRIMARY KEY, task TEXT NOT NULL, revision TEXT NOT NULL,
+		  definition TEXT NOT NULL, trigger_kind TEXT NOT NULL,
+		  trigger_id TEXT NOT NULL DEFAULT '', project TEXT NOT NULL,
+		  grants TEXT NOT NULL DEFAULT '', provider TEXT NOT NULL DEFAULT '',
+		  model TEXT NOT NULL DEFAULT '', timeout_ns INTEGER NOT NULL DEFAULT 0,
+		  max_cost_usd REAL NOT NULL DEFAULT 0, state TEXT NOT NULL,
+		  outcome TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '',
+		  detail TEXT NOT NULL DEFAULT '', log_path TEXT NOT NULL DEFAULT '',
+		  host TEXT NOT NULL DEFAULT '', pid INTEGER NOT NULL DEFAULT 0,
+		  started_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL DEFAULT '',
+		  finished_at TEXT NOT NULL DEFAULT '', seen TEXT NOT NULL DEFAULT 'unseen'
+		);
+		INSERT INTO runs (id, task, revision, definition, trigger_kind, project, state, started_at)
+		VALUES ('run_old', 'legacy', 'sha256:x', 'version: 1', 'manual', '/repo', 'done', '2026-09-10T00:00:00Z');`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	old.Close()
+
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("opening an older ledger must migrate it, got %v", err)
+	}
+	defer s.Close()
+
+	// The old row survives and reads back through the new columns.
+	got, err := s.Get(ctx, "run_old")
+	if err != nil {
+		t.Fatalf("reading a pre-migration row: %v", err)
+	}
+	if got.Task != "legacy" || got.Backlog != 0 || !got.OccurredAt.IsZero() {
+		t.Errorf("migrated row = %+v, want the old data with zeroed new columns", got)
+	}
+	// And the new columns are writable.
+	r, err := s.Create(ctx, Run{ID: "run_new", Task: "t", Revision: "sha256:y",
+		Definition: "version: 1", TriggerKind: "cron", TriggerID: "cron:x@2026",
+		Project: "/repo", StartedAt: clock, OccurredAt: clock, Backlog: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, _ := s.Get(ctx, r.ID)
+	if back.Backlog != 3 {
+		t.Errorf("backlog = %d, want 3 after migration", back.Backlog)
+	}
+	// Migration is idempotent.
+	s.Close()
+	if s2, err := Open(ctx, path); err != nil {
+		t.Errorf("re-opening a migrated ledger: %v", err)
+	} else {
+		s2.Close()
+	}
 }

@@ -115,6 +115,13 @@ type Run struct {
 	Detail  string
 	LogPath string
 
+	// OccurredAt is the LOGICAL time this run stands for, which is not when it
+	// started: a run_once recovery of Monday's occurrence executed on Wednesday
+	// occurred-at Monday. That is what makes a recovered run explainable.
+	OccurredAt time.Time
+	// Backlog counts occurrences dropped when this one was created.
+	Backlog int
+
 	Host string
 	PID  int
 
@@ -155,7 +162,12 @@ CREATE TABLE IF NOT EXISTS runs (
   started_at    TEXT NOT NULL,
   heartbeat_at  TEXT NOT NULL DEFAULT '',
   finished_at   TEXT NOT NULL DEFAULT '',
-  seen          TEXT NOT NULL DEFAULT 'unseen'
+  seen          TEXT NOT NULL DEFAULT 'unseen',
+  -- How many occurrences were deliberately NOT run when this one was created.
+  -- A collapsed backlog that is invisible is indistinguishable from a scheduler
+  -- that quietly stopped working.
+  backlog       INTEGER NOT NULL DEFAULT 0,
+  occurred_at   TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS runs_by_task ON runs(task, started_at DESC);
 CREATE INDEX IF NOT EXISTS runs_by_seen ON runs(seen, started_at DESC);
@@ -166,7 +178,7 @@ CREATE INDEX IF NOT EXISTS runs_by_seen ON runs(seen, started_at DESC);
 -- excluded: running a task by hand twice is a deliberate act, not a duplicate.
 CREATE UNIQUE INDEX IF NOT EXISTS runs_occurrence
   ON runs(task, trigger_id) WHERE trigger_id <> '';
-`
+` + leaseSchema
 
 // Store is the run ledger.
 type Store struct{ db *sql.DB }
@@ -203,7 +215,30 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("applying task-run schema: %w", err)
 	}
+	if err := migrate(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return &Store{db: db}, nil
+}
+
+// migrate brings a ledger created by an earlier version forward.
+//
+// CREATE TABLE IF NOT EXISTS does nothing to a table that already exists, so a
+// column added later never appears in an existing database — and every test
+// using a fresh temp DB passes while the real one fails on first use. Each
+// statement is additive and ignores "duplicate column", so running it against
+// an already-current database is a no-op.
+func migrate(ctx context.Context, db *sql.DB) error {
+	for _, stmt := range []string{
+		`ALTER TABLE runs ADD COLUMN backlog INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE runs ADD COLUMN occurred_at TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("migrating task ledger: %w", err)
+		}
+	}
+	return nil
 }
 
 // OpenDefault opens the ledger at its standard location.
@@ -264,11 +299,12 @@ func (s *Store) Create(ctx context.Context, r Run) (Run, error) {
 	}
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO runs (id, task, revision, definition, trigger_kind, trigger_id, project,
-		                  grants, provider, model, timeout_ns, max_cost_usd, state, started_at, seen)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		                  grants, provider, model, timeout_ns, max_cost_usd, state, started_at, seen,
+		                  backlog, occurred_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.Task, r.Revision, r.Definition, r.TriggerKind, r.TriggerID, r.Project,
 		strings.Join(r.Grants, ","), r.Provider, r.Model, int64(r.Timeout), r.MaxCostUSD,
-		string(r.State), ts(r.StartedAt), string(r.Seen))
+		string(r.State), ts(r.StartedAt), string(r.Seen), r.Backlog, ts(r.OccurredAt))
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
 			return Run{}, ErrOccupied
@@ -305,10 +341,29 @@ func (s *Store) Heartbeat(ctx context.Context, id string, now time.Time) error {
 // Finish closes a run. Terminal and idempotent: a run already done stays as it
 // was, so a late finisher cannot overwrite an interrupted verdict.
 func (s *Store) Finish(ctx context.Context, id string, outcome Outcome, summary, detail, logPath string, now time.Time) error {
+	// detail APPENDS: a note recorded before the run started (why this occurrence
+	// exists) must survive the outcome being written over the top of it.
 	_, err := s.db.ExecContext(ctx, `
-		UPDATE runs SET state=?, outcome=?, summary=?, detail=?, log_path=?, finished_at=?
+		UPDATE runs SET state=?, outcome=?, summary=?, log_path=?, finished_at=?,
+		                detail = CASE WHEN ? = '' THEN detail
+		                              WHEN detail = '' THEN ?
+		                              ELSE detail || char(10) || ? END
 		WHERE id=? AND state<>?`,
-		string(StateDone), string(outcome), summary, detail, logPath, ts(now), id, string(StateDone))
+		string(StateDone), string(outcome), summary, logPath, ts(now),
+		detail, detail, detail, id, string(StateDone))
+	return err
+}
+
+// Note records why a run exists — a recovered occurrence, a collapsed backlog —
+// before it executes, so the explanation survives even if the run then crashes.
+// Appends rather than replaces: a run may accumulate more than one note.
+func (s *Store) Note(ctx context.Context, id, note string) error {
+	if note == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE runs SET detail = CASE WHEN detail = '' THEN ? ELSE detail || char(10) || ? END
+		WHERE id=?`, note, note, id)
 	return err
 }
 
@@ -424,7 +479,7 @@ func (s *Store) Reconcile(ctx context.Context, now time.Time) (int, error) {
 
 const cols = `id, task, revision, definition, trigger_kind, trigger_id, project, grants,
 	provider, model, timeout_ns, max_cost_usd, state, outcome, summary, detail, log_path,
-	host, pid, started_at, heartbeat_at, finished_at, seen`
+	host, pid, started_at, heartbeat_at, finished_at, seen, backlog, occurred_at`
 
 func (s *Store) query(ctx context.Context, q string, args ...any) ([]Run, error) {
 	rows, err := s.db.QueryContext(ctx, q, args...)
@@ -435,12 +490,12 @@ func (s *Store) query(ctx context.Context, q string, args ...any) ([]Run, error)
 	var out []Run
 	for rows.Next() {
 		var r Run
-		var grants, started, heartbeat, finished string
+		var grants, started, heartbeat, finished, occurred string
 		var timeoutNS int64
 		if err := rows.Scan(&r.ID, &r.Task, &r.Revision, &r.Definition, &r.TriggerKind, &r.TriggerID,
 			&r.Project, &grants, &r.Provider, &r.Model, &timeoutNS, &r.MaxCostUSD, &r.State,
 			&r.Outcome, &r.Summary, &r.Detail, &r.LogPath, &r.Host, &r.PID,
-			&started, &heartbeat, &finished, &r.Seen); err != nil {
+			&started, &heartbeat, &finished, &r.Seen, &r.Backlog, &occurred); err != nil {
 			return nil, err
 		}
 		if grants != "" {
@@ -448,6 +503,7 @@ func (s *Store) query(ctx context.Context, q string, args ...any) ([]Run, error)
 		}
 		r.Timeout = time.Duration(timeoutNS)
 		r.StartedAt, r.HeartbeatAt, r.FinishedAt = parseTS(started), parseTS(heartbeat), parseTS(finished)
+		r.OccurredAt = parseTS(occurred)
 		out = append(out, r)
 	}
 	return out, rows.Err()

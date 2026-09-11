@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/memcode-ai/memcode/internal/config"
+	"github.com/memcode-ai/memcode/internal/gateway/occurrence"
 	"github.com/memcode-ai/memcode/internal/task"
 	"github.com/memcode-ai/memcode/internal/taskrun"
 )
@@ -237,6 +238,14 @@ var taskShowCmd = &cobra.Command{
 			fmt.Printf("  project     %s\n", project)
 		}
 		fmt.Printf("  cadence     %s\n", cadence(t))
+		for _, tr := range t.Triggers {
+			if tr.Manual {
+				continue
+			}
+			if n, ok, err := occurrence.Next(taskrun.Spec(tr), time.Now()); err == nil && ok {
+				fmt.Printf("  next fire   %s (%s)\n", n.Local().Format(time.RFC3339), tr.Missed)
+			}
+		}
 		fmt.Printf("  execution   %s", t.Execution.Mode)
 		if t.Execution.Procedure != "" {
 			fmt.Printf(" (procedure %s)", t.Execution.Procedure)
@@ -336,6 +345,41 @@ runs cannot change what the run meant.`,
 		}
 		if !run.OK() {
 			return fmt.Errorf("task %s: %s", t.Name, run.Outcome)
+		}
+		return nil
+	},
+}
+
+var taskPollCmd = &cobra.Command{
+	Use:   "poll",
+	Short: "Run whatever is due now (what the daemon does on its own)",
+	Long: `Recomputes due occurrences from the calendar and each trigger's watermark, then runs
+what the missed-run policy says to run. This is exactly what the gateway daemon does every 30
+seconds; running it by hand is how you watch it happen.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := cmd.Context()
+		root := taskRoot()
+		tasks, errs := task.Load(root, time.Now())
+		reportLoadErrors(errs)
+		store, err := openRuns(ctx)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		res := taskrun.NewRunner(store).Poll(ctx, tasks, root, time.Now())
+		for _, e := range res.Errs {
+			fmt.Fprintf(os.Stderr, "  ! %v\n", e)
+		}
+		if len(res.Started) == 0 {
+			fmt.Printf("Nothing due.")
+			if res.Skipped > 0 {
+				fmt.Printf(" %d occurrence(s) accounted for without running.", res.Skipped)
+			}
+			fmt.Println()
+			return nil
+		}
+		for _, r := range res.Started {
+			fmt.Printf("  %s %-22s %-16s %s\n", outcomeMark(r.Outcome), r.Task, r.Outcome, r.Summary)
 		}
 		return nil
 	},
@@ -488,6 +532,6 @@ var taskShowRunCmd = &cobra.Command{
 
 func init() {
 	taskCmd.AddCommand(taskListCmd, taskShowCmd, taskCheckCmd,
-		taskRunCmd, taskHistoryCmd, taskInboxCmd, taskAckCmd, taskShowRunCmd)
+		taskRunCmd, taskPollCmd, taskHistoryCmd, taskInboxCmd, taskAckCmd, taskShowRunCmd)
 	rootCmd.AddCommand(taskCmd)
 }

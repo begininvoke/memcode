@@ -2,6 +2,7 @@ package taskrun
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -64,6 +65,14 @@ func NewRunner(store *Store) *Runner {
 // one fixed thing forever, and it is why the definition is stored whole rather
 // than by reference — a run stays readable after its file is edited or deleted.
 func Freeze(t task.Task, root, triggerKind, triggerID string, now time.Time) (Run, error) {
+	return FreezeAt(t, root, triggerKind, triggerID, now, now, 0)
+}
+
+// FreezeAt is Freeze with the LOGICAL occurrence this run stands for, and the
+// size of the backlog collapsed into it. A run_once recovery of Monday's
+// occurrence executed on Wednesday is occurredAt Monday: the ledger then says
+// which firing was recovered, instead of only when someone got round to it.
+func FreezeAt(t task.Task, root, triggerKind, triggerID string, occurredAt, now time.Time, backlog int) (Run, error) {
 	rev, err := t.Revision()
 	if err != nil {
 		return Run{}, err
@@ -98,6 +107,8 @@ func Freeze(t task.Task, root, triggerKind, triggerID string, now time.Time) (Ru
 		Timeout:     t.Timeout(),
 		MaxCostUSD:  t.Limits.MaxCostUSD,
 		StartedAt:   now,
+		OccurredAt:  occurredAt,
+		Backlog:     backlog,
 		Seen:        SeenUnseen,
 	}, nil
 }
@@ -155,11 +166,31 @@ func (r *Runner) Execute(ctx context.Context, run Run, t task.Task) (Run, error)
 		return r.Store.Get(ctx, run.ID)
 	}
 
+	// Exclusive use of the resource this run mutates. Taken AFTER the claim so a
+	// run that loses the claim never touches the lease, and released on every
+	// path out — including a panic — so a crash is the only way to leave one
+	// behind, which the expiry rule then handles.
+	key := LeaseKey(t, run.Project)
+	if err := r.Store.Acquire(ctx, key, run.ID, run.Task, time.Now()); err != nil {
+		var held ErrLeaseHeld
+		if errors.As(err, &held) {
+			_ = r.Store.Finish(ctx, run.ID, OutcomeBlocked,
+				"another run holds this project",
+				fmt.Sprintf("Waiting on run %s (task %s). Mutating tasks in one project run "+
+					"one at a time; read-only tasks are free to overlap.", held.Holder.RunID, held.Holder.Task),
+				"", time.Now())
+			return r.Store.Get(ctx, run.ID)
+		}
+		return run, err
+	}
+	defer func() { _ = r.Store.Release(context.WithoutCancel(ctx), key, run.ID) }()
+
 	// Heartbeat for as long as the work runs. Its absence is how Reconcile
-	// distinguishes a crashed run from a slow one.
+	// distinguishes a crashed run from a slow one, and the same beat keeps the
+	// lease alive so the two notions of "that process is gone" cannot disagree.
 	hbCtx, stopHB := context.WithCancel(ctx)
 	defer stopHB()
-	go r.heartbeat(hbCtx, run.ID)
+	go r.heartbeat(hbCtx, run.ID, key)
 
 	runCtx := ctx
 	if run.Timeout > 0 {
@@ -194,7 +225,7 @@ func (r *Runner) Run(ctx context.Context, t task.Task, root, triggerKind, trigge
 	return r.Execute(ctx, run, t)
 }
 
-func (r *Runner) heartbeat(ctx context.Context, id string) {
+func (r *Runner) heartbeat(ctx context.Context, id, leaseKey string) {
 	every := r.HeartbeatEvery
 	if every <= 0 {
 		every = 20 * time.Second
@@ -210,6 +241,7 @@ func (r *Runner) heartbeat(ctx context.Context, id string) {
 			// its last heartbeat rather than look stale to Reconcile.
 			hbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			_ = r.Store.Heartbeat(hbCtx, id, now)
+			_ = r.Store.Renew(hbCtx, leaseKey, id, now)
 			cancel()
 		}
 	}

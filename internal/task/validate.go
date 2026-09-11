@@ -189,6 +189,18 @@ func (tr Trigger) Validate(now time.Time) error {
 	if strings.TrimSpace(tr.At) != "" && tr.Missed == MissedCatchUp {
 		return fmt.Errorf("catch_up is meaningless for a one-shot at trigger")
 	}
+	if tr.MaxCatchUp != 0 {
+		if tr.Missed != MissedCatchUp {
+			return fmt.Errorf("max_catch_up only applies to missed: catch_up")
+		}
+		if tr.MaxCatchUp < 0 {
+			return fmt.Errorf("max_catch_up must be positive")
+		}
+		if tr.MaxCatchUp > HardMaxCatchUp {
+			return fmt.Errorf("max_catch_up %d exceeds the hard limit of %d — a backlog that "+
+				"large is a stampede, not a catch-up", tr.MaxCatchUp, HardMaxCatchUp)
+		}
+	}
 	return nil
 }
 

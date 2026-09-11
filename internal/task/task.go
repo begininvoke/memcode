@@ -79,6 +79,11 @@ type Trigger struct {
 	// Missed decides what happens when the daemon was not running at the moment
 	// this trigger was due. Meaningless for Manual.
 	Missed Missed `yaml:"missed,omitempty" json:"missed,omitempty"`
+	// MaxCatchUp bounds how many missed occurrences catch_up will actually run.
+	// Without a bound, a laptop returning after months with an hourly task would
+	// enqueue thousands of historical runs at once. Ignored unless Missed is
+	// catch_up; the excess is dropped newest-first-kept and surfaced on the run.
+	MaxCatchUp int `yaml:"max_catch_up,omitempty" json:"max_catch_up,omitempty"`
 	// Manual is an explicit "this trigger only fires by hand". A task with no
 	// triggers at all is already manual-only; this exists so a file can say so.
 	Manual bool `yaml:"manual,omitempty" json:"manual,omitempty"`
@@ -110,8 +115,17 @@ const (
 	MissedRunOnce Missed = "run_once"
 	// MissedSkip forgets the occurrence entirely (the old schedule behaviour).
 	MissedSkip Missed = "skip"
-	// MissedCatchUp replays every missed occurrence. Rarely what anyone wants.
+	// MissedCatchUp replays missed occurrences, up to Trigger.MaxCatchUp. Rarely
+	// what anyone wants.
 	MissedCatchUp Missed = "catch_up"
+)
+
+// DefaultMaxCatchUp bounds catch_up when a trigger does not say. HardMaxCatchUp
+// bounds what a trigger may ASK for: a YAML value is a ceiling request, not an
+// override, and nothing should be able to schedule a thousand-run stampede.
+const (
+	DefaultMaxCatchUp = 10
+	HardMaxCatchUp    = 100
 )
 
 // Mode is how the task's work gets done.
@@ -349,6 +363,9 @@ func (t *Task) ApplyDefaults() {
 	for i := range t.Triggers {
 		if t.Triggers[i].Missed == "" && !t.Triggers[i].Manual {
 			t.Triggers[i].Missed = MissedRunOnce
+		}
+		if t.Triggers[i].Missed == MissedCatchUp && t.Triggers[i].MaxCatchUp == 0 {
+			t.Triggers[i].MaxCatchUp = DefaultMaxCatchUp
 		}
 	}
 }

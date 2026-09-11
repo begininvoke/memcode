@@ -219,6 +219,7 @@ func Run(ctx context.Context, root string, mainStore store.Store, settings gwcon
 	// re-reads settings via r.cfg() every tick, so an agent made autonomous
 	// later through a hot-reloaded config is picked up without a restart.
 	go rt.autonomousWakeLoop(ctx) // agent-authored next-wakes feed the same inbox
+	go rt.taskPollLoop(ctx, out)  // autonomous tasks: recomputed from the calendar, not timed
 
 	rt.runWorker(ctx) // blocks until ctx is cancelled
 	if rt.sched != nil {
