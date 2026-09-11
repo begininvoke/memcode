@@ -76,53 +76,78 @@ func cadence(t task.Task) string {
 	return strings.Join(parts, ", ")
 }
 
-// gitShadowsTasks reports the root .gitignore rule that hides .memcode/tasks
-// from git, if any. A project task is meant to be committed and reviewed, but
-// git never descends into an ignored directory, so a repo-wide `.memcode/` rule
-// silently wins over the exception memcode writes inside it.
+// taskVisibility reports whether .memcode/tasks is actually reachable by git,
+// and if not, the exact remedy.
 //
-// This is REPORTED, never fixed: the root .gitignore is a file the user curates,
-// and EnsureGitignore's whole contract is that memcode does not edit it. Saying
-// so plainly beats either editing it behind their back or letting them believe a
-// task is committed when it is not.
-func gitShadowsTasks(root string) (rule string, shadowed bool) {
+// The subtlety that makes this worth real code: git does NOT descend into an
+// ignored directory, so a repo whose .gitignore says `.memcode/` cannot be
+// fixed by ADDING an exception — `!.memcode/tasks/` under it does nothing at
+// all. The ignore of the parent has to be loosened to `.memcode/*` first, which
+// ignores the children while leaving the directory itself traversable. Verified
+// against real `git check-ignore` behaviour in TestTaskVisibilityRemedy.
+type taskVisibility struct {
+	Rule     string   // the winning ignore rule, e.g. ".gitignore:4:.memcode/"
+	Remedy   []string // the lines that actually expose tasks/
+	Shadowed bool
+}
+
+// RemedyLines are the ignore rules that expose .memcode/tasks while leaving the
+// rest of .memcode ignored. They REPLACE a `.memcode/` rule rather than joining
+// it; the second line makes the fix self-sufficient even if memcode's own
+// .memcode/.gitignore is missing or has been edited.
+var RemedyLines = []string{".memcode/*", "!.memcode/tasks/"}
+
+func checkTaskVisibility(root string) taskVisibility {
 	if root == "" {
-		return "", false
+		return taskVisibility{}
 	}
 	dir := filepath.Join(root, ".memcode", "tasks")
 	if _, err := os.Stat(dir); err != nil {
-		return "", false
+		return taskVisibility{}
 	}
 	if _, err := exec.LookPath("git"); err != nil {
-		return "", false
+		return taskVisibility{}
 	}
-	// check-ignore exits 0 when the path IS ignored, naming the winning rule.
-	cmd := exec.Command("git", "-C", root, "check-ignore", "-v", filepath.Join(dir, ".probe.yaml"))
-	out, err := cmd.Output()
+	probe := filepath.Join(dir, ".probe.yaml")
+	// The boolean comes from -q, NOT from -v. With -v, check-ignore exits 0
+	// whenever any pattern MATCHES, including a negation, so a healthy repo
+	// whose !tasks/** rule matched would be reported as shadowed. -q exits 0
+	// only when the path is genuinely excluded.
+	if err := exec.Command("git", "-C", root, "check-ignore", "-q", probe).Run(); err != nil {
+		return taskVisibility{} // visible, or not a git repo
+	}
+	out, err := exec.Command("git", "-C", root, "check-ignore", "-v", probe).Output()
 	if err != nil {
-		return "", false // not ignored, or not a git repo
+		return taskVisibility{Remedy: RemedyLines, Shadowed: true}
 	}
 	line := strings.TrimSpace(string(out))
 	if line == "" {
-		return "", false
+		return taskVisibility{Remedy: RemedyLines, Shadowed: true}
 	}
-	// "<file>:<line>:<pattern>\t<path>" — the pattern is the useful half.
+	// "<file>:<line>:<pattern>\t<path>" — the rule is the useful half.
+	rule := line
 	if fields := strings.SplitN(line, "\t", 2); len(fields) > 0 {
-		return fields[0], true
+		rule = fields[0]
 	}
-	return line, true
+	return taskVisibility{Rule: rule, Remedy: RemedyLines, Shadowed: true}
 }
 
-// warnIfShadowed prints the one line a user needs to make project tasks
-// committable, when something upstream is hiding them.
+// warnIfShadowed prints what is hiding project tasks and how to fix it.
+//
+// It REPORTS and never fixes: the root .gitignore is a file the user curates,
+// and EnsureGitignore's standing contract is that memcode does not edit it.
 func warnIfShadowed(root string) {
-	rule, shadowed := gitShadowsTasks(root)
-	if !shadowed {
+	v := checkTaskVisibility(root)
+	if !v.Shadowed {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "\n  ! project tasks are not visible to git — %s ignores them.\n", rule)
+	fmt.Fprintf(os.Stderr, "\n  ! project tasks are not visible to git — %s ignores them.\n", v.Rule)
 	fmt.Fprintf(os.Stderr, "    They still run, but they will not travel with the repo or show up in review.\n")
-	fmt.Fprintf(os.Stderr, "    To commit them, add this to the repo's .gitignore:  !.memcode/tasks/\n")
+	fmt.Fprintf(os.Stderr, "    Git will not descend into an ignored directory, so adding an exception under\n")
+	fmt.Fprintf(os.Stderr, "    that rule does nothing. REPLACE it in .gitignore with:\n")
+	for _, l := range v.Remedy {
+		fmt.Fprintf(os.Stderr, "        %s\n", l)
+	}
 }
 
 var taskListCmd = &cobra.Command{
