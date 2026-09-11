@@ -89,6 +89,25 @@ type Settings struct {
 	// assistant identity with its own home (memory/skills/instructions), distinct
 	// from any project. A channel binds to one by name (Channel.Agent).
 	Agents map[string]Agent `yaml:"agents,omitempty"`
+	// AuthorizedRuntimes records which execution backends the user has allowed
+	// autonomous tasks to use, and how far each permission reaches. A credential
+	// discovered on the machine grants nothing until it appears here: the user
+	// signed into that other tool, not into a scheduler that spends their quota
+	// while they sleep. Shaped as runtimes.Grant; kept here because gateway.yaml
+	// is the machine's configuration and this is machine-scoped permission.
+	AuthorizedRuntimes []RuntimeGrant `yaml:"authorized_runtimes,omitempty"`
+}
+
+// RuntimeGrant mirrors runtimes.Grant on disk. Duplicated rather than imported
+// so the config package stays free of a dependency on the runtime registry.
+type RuntimeGrant struct {
+	ID        string `yaml:"id"`
+	Runtime   string `yaml:"runtime"`
+	Scope     string `yaml:"scope"`
+	Task      string `yaml:"task,omitempty"`
+	Run       string `yaml:"run,omitempty"`
+	GrantedAt string `yaml:"granted_at"`
+	Revoked   bool   `yaml:"revoked,omitempty"`
 }
 
 // Agent is a durable agent identity: a home directory (~/.memcode/agents/<id>)
@@ -434,18 +453,143 @@ func Load() (Settings, error) {
 	return s, nil
 }
 
-// Validate checks additive configuration discriminators while preserving
-// legacy zero values.
-func (s Settings) Validate() error {
+// LoadFor parses gateway.yaml and validates only the sections a command
+// depends on.
+//
+// Parsing is identical and just as strict — a malformed file still fails, and a
+// removed field is still captured rather than ignored. What narrows is which
+// SEMANTIC errors are fatal to this caller. `task runtime authorize` needs the
+// authorization list to make sense; it does not need someone's agent stanza to
+// be migrated first.
+func LoadFor(sections ...Section) (Settings, error) {
+	p, err := Path()
+	if err != nil {
+		return Settings{}, err
+	}
+	b, err := os.ReadFile(p)
+	if errors.Is(err, os.ErrNotExist) {
+		return Settings{}, nil
+	}
+	if err != nil {
+		return Settings{}, err
+	}
+	var s Settings
+	if err := yaml.Unmarshal(b, &s); err != nil {
+		return Settings{}, fmt.Errorf("parsing %s: %w", p, err)
+	}
+	if err := s.ValidateSections(sections...); err != nil {
+		return Settings{}, fmt.Errorf("validating %s: %w", p, err)
+	}
+	return s, nil
+}
+
+// Section names one dependency surface of gateway.yaml.
+//
+// Validation is scoped by section because a single file holding every
+// subsystem's configuration should not mean every subsystem's mistakes block
+// every command. Authorizing a runtime has nothing to do with agent
+// definitions, and a stale agent stanza making that impossible is coupling by
+// accident rather than by design.
+//
+// PARSING stays strict and global: a removed field is still rejected loudly
+// wherever it is read, and nothing here silently accepts or rewrites one. Only
+// the SEMANTIC checks narrow to what a command actually depends on.
+type Section string
+
+const (
+	SectionAgents      Section = "agents"
+	SectionChannels    Section = "channels"
+	SectionSchedules   Section = "schedules"
+	SectionProjects    Section = "projects"
+	SectionRuntimeAuth Section = "authorized_runtimes"
+)
+
+// AllSections is every dependency surface, for callers that genuinely need the
+// whole file to be coherent — the gateway daemon, chiefly, which runs all of it.
+func AllSections() []Section {
+	return []Section{SectionAgents, SectionChannels, SectionSchedules, SectionProjects, SectionRuntimeAuth}
+}
+
+// Validate checks every section. Equivalent to ValidateSections(AllSections()...).
+func (s Settings) Validate() error { return s.ValidateSections(AllSections()...) }
+
+// ValidateSections checks only the named sections.
+func (s Settings) ValidateSections(sections ...Section) error {
+	for _, sec := range sections {
+		var err error
+		switch sec {
+		case SectionAgents:
+			err = s.validateAgents()
+		case SectionRuntimeAuth:
+			err = s.validateRuntimeAuth()
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s Settings) validateAgents() error {
 	for id, agent := range s.Agents {
 		if agent.LegacyKind != "" {
-			return fmt.Errorf("agent %q still uses the removed `kind: %s` setting. Autonomy is now explicit: replace it with `autonomous: true` (and an `objective:` describing what it works toward) if this agent should keep running on its own, or just delete the `kind:` line if it should not. Its home under ~/.memcode/agents/%s is untouched either way", id, agent.LegacyKind, id)
+			return fmt.Errorf(`agent %q uses the removed `+"`kind: %s`"+` setting.
+
+`+"`kind: %s`"+` bundled two separate things, and they are now set independently:
+
+  autonomous: true      may this agent act with nobody watching
+  objective: "..."      the standing goal it works toward, if it has one
+
+To migrate, in %s:
+
+  - if this agent should still run unattended, replace the `+"`kind:`"+` line with
+    `+"`autonomous: true`"+`, and add an `+"`objective:`"+` if it is pursuing something
+  - if it should only run when you ask, just delete the `+"`kind:`"+` line
+
+Its home under ~/.memcode/agents/%s — memory, skills, instructions — is
+untouched either way.`, id, agent.LegacyKind, agent.LegacyKind, pathOrDefault(), id)
 		}
 		if agent.Browser != "" && agent.Browser != BrowserEphemeral && agent.Browser != BrowserExistingChrome {
 			return fmt.Errorf("agent %q has unknown browser %q (want %s or %s)", id, agent.Browser, BrowserEphemeral, BrowserExistingChrome)
 		}
 	}
 	return nil
+}
+
+// validateRuntimeAuth checks grants STRUCTURALLY — a grant must say what it
+// authorizes and how far it reaches. Whether the named runtime exists is the
+// runtime registry's question, deliberately not asked here: config should not
+// depend on the registry, and a grant for a runtime this build no longer knows
+// should be inert rather than fatal.
+func (s Settings) validateRuntimeAuth() error {
+	for i, g := range s.AuthorizedRuntimes {
+		where := fmt.Sprintf("authorized_runtimes[%d]", i)
+		if strings.TrimSpace(g.Runtime) == "" {
+			return fmt.Errorf("%s names no runtime", where)
+		}
+		switch g.Scope {
+		case "all":
+		case "task":
+			if strings.TrimSpace(g.Task) == "" {
+				return fmt.Errorf("%s is task-scoped but names no task", where)
+			}
+		case "run":
+			if strings.TrimSpace(g.Run) == "" {
+				return fmt.Errorf("%s is run-scoped but names no run", where)
+			}
+		default:
+			return fmt.Errorf("%s has unknown scope %q (use all, task or run)", where, g.Scope)
+		}
+	}
+	return nil
+}
+
+// pathOrDefault names the config file for an error message, best-effort.
+func pathOrDefault() string {
+	if p, err := Path(); err == nil {
+		return p
+	}
+	return "gateway.yaml"
 }
 
 // Browser backends for Agent.Browser.
@@ -467,8 +611,16 @@ func (a Agent) Unattended() bool { return a.Autonomous }
 
 // Save writes gateway.yaml atomically. 0600 — it holds no secrets, but the
 // allow-list of user ids is sensitive on a shared host, so keep it owner-only.
-func Save(s Settings) error {
-	if err := s.Validate(); err != nil {
+func Save(s Settings) error { return SaveFor(s, AllSections()...) }
+
+// SaveFor writes gateway.yaml, validating only the named sections.
+//
+// Untouched sections round-trip VERBATIM, including a legacy field the caller
+// never looked at: LegacyKind marshals back out as `kind:`, so writing a runtime
+// authorization preserves a stale agent stanza exactly rather than dropping it
+// or quietly migrating it. Narrow validation must not become silent data loss.
+func SaveFor(s Settings, sections ...Section) error {
+	if err := s.ValidateSections(sections...); err != nil {
 		return err
 	}
 	p, err := Path()

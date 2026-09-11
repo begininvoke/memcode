@@ -172,3 +172,124 @@ func TestLegacyKindIsRejectedWithAFix(t *testing.T) {
 		}
 	}
 }
+
+// One file holds every subsystem's configuration, but a stale stanza in one
+// section must not make unrelated commands impossible. Authorizing a runtime
+// has nothing to do with agent definitions.
+func TestValidateSectionsIsScoped(t *testing.T) {
+	stale := Settings{
+		Agents: map[string]Agent{"demo": {LegacyKind: "personal"}},
+		AuthorizedRuntimes: []RuntimeGrant{
+			{ID: "auth_1", Runtime: "codex", Scope: "all", GrantedAt: "2026-09-12T00:00:00Z"},
+		},
+	}
+	if err := stale.ValidateSections(SectionRuntimeAuth); err != nil {
+		t.Errorf("a stale agent must not block runtime-auth validation: %v", err)
+	}
+	// The agent section itself is still refused, loudly.
+	if err := stale.ValidateSections(SectionAgents); err == nil {
+		t.Error("the removed kind: field must still be rejected")
+	}
+	if err := stale.Validate(); err == nil {
+		t.Error("whole-file validation must still catch it")
+	}
+}
+
+// The migration error has to be actionable: this is a KNOWN migration with
+// known semantics, so it says exactly what to write.
+func TestLegacyKindErrorGivesTheMigration(t *testing.T) {
+	s := Settings{Agents: map[string]Agent{"demo": {LegacyKind: "personal"}}}
+	err := s.ValidateSections(SectionAgents)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"kind: personal",   // what they have
+		"autonomous: true", // what replaces the permission half
+		"objective:",       // what replaces the intent half
+		"untouched",        // that their agent home survives
+		"demo",             // which agent
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("the migration error should mention %q:\n%s", want, msg)
+		}
+	}
+}
+
+// Narrow validation must not become silent data loss: a section this caller
+// never validated must round-trip verbatim, legacy fields included.
+func TestSaveForPreservesUnvalidatedSections(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	p, err := Path()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A config a whole-file Validate would reject.
+	if err := os.WriteFile(p, []byte("agents:\n    demo:\n        kind: personal\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := LoadFor(SectionRuntimeAuth)
+	if err != nil {
+		t.Fatalf("loading for one section must not trip over another: %v", err)
+	}
+	s.AuthorizedRuntimes = append(s.AuthorizedRuntimes, RuntimeGrant{
+		ID: "auth_x", Runtime: "codex", Scope: "all", GrantedAt: "2026-09-12T00:00:00Z",
+	})
+	if err := SaveFor(s, SectionRuntimeAuth); err != nil {
+		t.Fatalf("SaveFor: %v", err)
+	}
+
+	back, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(back)
+	if !strings.Contains(got, "kind: personal") {
+		t.Errorf("the untouched agent stanza must survive verbatim — neither dropped nor migrated:\n%s", got)
+	}
+	if !strings.Contains(got, "auth_x") {
+		t.Errorf("the new authorization should be written:\n%s", got)
+	}
+	// And the file is still rejected by a whole-file load, because nothing here
+	// migrated anything on the user's behalf.
+	if _, err := Load(); err == nil {
+		t.Error("a narrow save must not quietly fix the user's config")
+	}
+}
+
+func TestRuntimeAuthValidation(t *testing.T) {
+	cases := []struct {
+		name  string
+		grant RuntimeGrant
+		bad   bool
+	}{
+		{"ok all", RuntimeGrant{Runtime: "codex", Scope: "all"}, false},
+		{"ok task", RuntimeGrant{Runtime: "codex", Scope: "task", Task: "nightly"}, false},
+		{"ok run", RuntimeGrant{Runtime: "codex", Scope: "run", Run: "run_1"}, false},
+		{"no runtime", RuntimeGrant{Scope: "all"}, true},
+		{"bad scope", RuntimeGrant{Runtime: "codex", Scope: "forever"}, true},
+		{"task without name", RuntimeGrant{Runtime: "codex", Scope: "task"}, true},
+		{"run without id", RuntimeGrant{Runtime: "codex", Scope: "run"}, true},
+		// A runtime this build does not know is INERT, not fatal: config must not
+		// depend on the runtime registry.
+		{"unknown runtime is not fatal", RuntimeGrant{Runtime: "some-future-thing", Scope: "all"}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := Settings{AuthorizedRuntimes: []RuntimeGrant{c.grant}}
+			err := s.ValidateSections(SectionRuntimeAuth)
+			if c.bad && err == nil {
+				t.Error("expected a validation error")
+			}
+			if !c.bad && err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+}
