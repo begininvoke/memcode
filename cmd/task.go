@@ -250,7 +250,9 @@ var taskShowCmd = &cobra.Command{
 		if t.Execution.Procedure != "" {
 			fmt.Printf(" (procedure %s)", t.Execution.Procedure)
 		}
-		fmt.Printf("\n  runtime     %s / %s\n", t.Agent.Provider, t.Agent.Model)
+		fmt.Printf("\n  runtime     %s\n", t.Runtime.Strategy)
+		fmt.Printf("  allowed     %s\n", strings.Join(t.Runtime.Allowed, " > "))
+		fmt.Printf("  model       %s\n", t.Runtime.Model)
 		fmt.Printf("  timeout     %s\n", t.Timeout())
 
 		// Show the EXPANDED authority, not the tier name. The tier is a label;
@@ -330,8 +332,8 @@ runs cannot change what the run meant.`,
 				t.Name, active[0].ID)
 		}
 
-		fmt.Printf("%s · %s · %s\n", t.Name, t.Autonomy.Level, t.Agent.Provider)
-		run, err := taskrun.NewRunner(store).Run(ctx, t, root, taskrun.TriggerManual, "")
+		fmt.Printf("%s · %s · %s\n", t.Name, t.Autonomy.Level, t.Runtime.Strategy)
+		run, err := taskrun.NewRunner(store, loadAuthorizations).Run(ctx, t, root, taskrun.TriggerManual, "")
 		if err != nil {
 			return err
 		}
@@ -366,7 +368,7 @@ seconds; running it by hand is how you watch it happen.`,
 			return err
 		}
 		defer store.Close()
-		res := taskrun.NewRunner(store).Poll(ctx, tasks, root, time.Now())
+		res := taskrun.NewRunner(store, loadAuthorizations).Poll(ctx, tasks, root, time.Now())
 		for _, e := range res.Errs {
 			fmt.Fprintf(os.Stderr, "  ! %v\n", e)
 		}
@@ -510,7 +512,21 @@ var taskShowRunCmd = &cobra.Command{
 			fmt.Printf(" (%s)", r.TriggerID)
 		}
 		fmt.Printf("\n  project     %s\n", r.Project)
-		fmt.Printf("  runtime     %s / %s\n", r.Provider, r.Model)
+		fmt.Printf("  runtime     %s", r.RuntimeResolved)
+		if r.ModelResolved != "" {
+			fmt.Printf(" / %s", r.ModelResolved)
+		}
+		if r.RuntimeRequested != "" {
+			fmt.Printf("  (asked for %s", r.RuntimeRequested)
+			if r.ModelRequested != "" {
+				fmt.Printf(" / %s", r.ModelRequested)
+			}
+			fmt.Printf(")")
+		}
+		fmt.Println()
+		if r.AuthID != "" {
+			fmt.Printf("  authorized  %s (%s scope)\n", r.AuthID, r.AuthScope)
+		}
 		fmt.Printf("  authority   %s\n", strings.Join(r.Grants, ", "))
 		fmt.Printf("  state       %s / %s (%s)\n", r.State, r.Outcome, r.Seen)
 		fmt.Printf("  started     %s\n", r.StartedAt.Local().Format(time.RFC3339))

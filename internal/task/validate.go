@@ -7,6 +7,7 @@ import (
 	"time"
 
 	gwconfig "github.com/memcode-ai/memcode/internal/gateway/config"
+	"github.com/memcode-ai/memcode/internal/runtimes"
 )
 
 // nameRe is the task name charset. Names become filenames, branch names, lock
@@ -44,6 +45,9 @@ func (t Task) Validate(now time.Time) error {
 	// Expanding resolves the level and refuses unknown grants. Doing it here
 	// means a typo fails at load, not at 3am with nobody watching.
 	if _, err := t.Grants(); err != nil {
+		return err
+	}
+	if err := t.validateRuntime(); err != nil {
 		return err
 	}
 	if err := t.validateGit(); err != nil {
@@ -92,6 +96,25 @@ func (t Task) validateExecution() error {
 		}
 	default:
 		return fmt.Errorf("unknown execution mode %q (use agent, procedure or hybrid)", t.Execution.Mode)
+	}
+	return nil
+}
+
+func (t Task) validateRuntime() error {
+	if !runtimes.ValidStrategy(runtimes.Strategy(t.Runtime.Strategy)) {
+		var names []string
+		for _, s := range runtimes.Strategies() {
+			names = append(names, string(s))
+		}
+		return fmt.Errorf("unknown runtime.strategy %q (use %s)", t.Runtime.Strategy, strings.Join(names, ", "))
+	}
+	for _, id := range append(append([]string{}, t.Runtime.Allowed...), t.Runtime.Fallback...) {
+		if _, ok := runtimes.Get(id); !ok {
+			return fmt.Errorf("unknown runtime %q (known: %s)", id, strings.Join(runtimes.IDs(), ", "))
+		}
+	}
+	if runtimes.Strategy(t.Runtime.Strategy) == runtimes.StrategyExplicit && len(t.Runtime.Allowed) == 0 {
+		return fmt.Errorf("runtime.strategy explicit needs runtime.allowed to name the required runtime")
 	}
 	return nil
 }

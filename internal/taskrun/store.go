@@ -104,10 +104,19 @@ type Run struct {
 
 	Project    string
 	Grants     []string
-	Provider   string
-	Model      string
 	Timeout    time.Duration
 	MaxCostUSD float64
+
+	// Where the inference ran. Requested and resolved are both frozen at
+	// creation, so the choice stays explainable after the machine's state and
+	// the user's authorizations have moved on.
+	RuntimeRequested string
+	RuntimeResolved  string
+	ModelRequested   string
+	ModelResolved    string
+	CredSource       string
+	AuthID           string
+	AuthScope        string
 
 	State   State
 	Outcome Outcome
@@ -213,7 +222,17 @@ CREATE TABLE IF NOT EXISTS runs (
   pr_url          TEXT NOT NULL DEFAULT '',
   created_branch  INTEGER NOT NULL DEFAULT 0,
   created_commit  INTEGER NOT NULL DEFAULT 0,
-  created_pr      INTEGER NOT NULL DEFAULT 0
+  created_pr      INTEGER NOT NULL DEFAULT 0,
+  -- WHERE the inference ran, frozen before execution. Requested and resolved are
+  -- both kept: "why did this run through Codex rather than hosted memcode" is
+  -- only answerable if you can see what it asked for as well as what it got.
+  runtime_requested TEXT NOT NULL DEFAULT '',
+  runtime_resolved  TEXT NOT NULL DEFAULT '',
+  model_requested   TEXT NOT NULL DEFAULT '',
+  model_resolved    TEXT NOT NULL DEFAULT '',
+  cred_source       TEXT NOT NULL DEFAULT '',
+  auth_id           TEXT NOT NULL DEFAULT '',
+  auth_scope        TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS runs_by_task ON runs(task, started_at DESC);
 CREATE INDEX IF NOT EXISTS runs_by_seen ON runs(seen, started_at DESC);
@@ -294,6 +313,13 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		`ALTER TABLE runs ADD COLUMN created_branch INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE runs ADD COLUMN created_commit INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE runs ADD COLUMN created_pr INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE runs ADD COLUMN runtime_requested TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE runs ADD COLUMN runtime_resolved TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE runs ADD COLUMN model_requested TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE runs ADD COLUMN model_resolved TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE runs ADD COLUMN cred_source TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE runs ADD COLUMN auth_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE runs ADD COLUMN auth_scope TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := db.ExecContext(ctx, stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migrating task ledger: %w", err)
@@ -360,12 +386,15 @@ func (s *Store) Create(ctx context.Context, r Run) (Run, error) {
 	}
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO runs (id, task, revision, definition, trigger_kind, trigger_id, project,
-		                  grants, provider, model, timeout_ns, max_cost_usd, state, started_at, seen,
-		                  backlog, occurred_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		                  grants, timeout_ns, max_cost_usd, state, started_at, seen,
+		                  backlog, occurred_at, runtime_requested, runtime_resolved,
+		                  model_requested, model_resolved, cred_source, auth_id, auth_scope)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.Task, r.Revision, r.Definition, r.TriggerKind, r.TriggerID, r.Project,
-		strings.Join(r.Grants, ","), r.Provider, r.Model, int64(r.Timeout), r.MaxCostUSD,
-		string(r.State), ts(r.StartedAt), string(r.Seen), r.Backlog, ts(r.OccurredAt))
+		strings.Join(r.Grants, ","), int64(r.Timeout), r.MaxCostUSD,
+		string(r.State), ts(r.StartedAt), string(r.Seen), r.Backlog, ts(r.OccurredAt),
+		r.RuntimeRequested, r.RuntimeResolved, r.ModelRequested, r.ModelResolved,
+		r.CredSource, r.AuthID, r.AuthScope)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
 			return Run{}, ErrOccupied
@@ -579,10 +608,12 @@ func (s *Store) Reconcile(ctx context.Context, now time.Time) (int, error) {
 }
 
 const cols = `id, task, revision, definition, trigger_kind, trigger_id, project, grants,
-	provider, model, timeout_ns, max_cost_usd, state, outcome, summary, detail, log_path,
+	timeout_ns, max_cost_usd, state, outcome, summary, detail, log_path,
 	host, pid, started_at, heartbeat_at, finished_at, seen, backlog, occurred_at,
 	exec_status, verify_status, checks, worktree, branch, base_rev, result_rev, changed,
-	remote, commit_sha, pr_number, pr_url, created_branch, created_commit, created_pr`
+	remote, commit_sha, pr_number, pr_url, created_branch, created_commit, created_pr,
+	runtime_requested, runtime_resolved, model_requested, model_resolved, cred_source,
+	auth_id, auth_scope`
 
 func (s *Store) query(ctx context.Context, q string, args ...any) ([]Run, error) {
 	rows, err := s.db.QueryContext(ctx, q, args...)
@@ -596,13 +627,15 @@ func (s *Store) query(ctx context.Context, q string, args ...any) ([]Run, error)
 		var grants, started, heartbeat, finished, occurred string
 		var timeoutNS int64
 		if err := rows.Scan(&r.ID, &r.Task, &r.Revision, &r.Definition, &r.TriggerKind, &r.TriggerID,
-			&r.Project, &grants, &r.Provider, &r.Model, &timeoutNS, &r.MaxCostUSD, &r.State,
+			&r.Project, &grants, &timeoutNS, &r.MaxCostUSD, &r.State,
 			&r.Outcome, &r.Summary, &r.Detail, &r.LogPath, &r.Host, &r.PID,
 			&started, &heartbeat, &finished, &r.Seen, &r.Backlog, &occurred,
 			&r.ExecStatus, &r.VerifyStatus, &r.Checks, &r.Worktree, &r.Branch,
 			&r.BaseRev, &r.ResultRev, &r.Changed,
 			&r.Remote, &r.CommitSHA, &r.PRNumber, &r.PRURL,
-			&r.CreatedBranch, &r.CreatedCommit, &r.CreatedPR); err != nil {
+			&r.CreatedBranch, &r.CreatedCommit, &r.CreatedPR,
+			&r.RuntimeRequested, &r.RuntimeResolved, &r.ModelRequested, &r.ModelResolved,
+			&r.CredSource, &r.AuthID, &r.AuthScope); err != nil {
 			return nil, err
 		}
 		if grants != "" {

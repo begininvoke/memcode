@@ -233,3 +233,27 @@ func resolveClaudeSub() (Endpoint, bool) {
 		Model:   sourceModel(catalog.ModelSonnet), // Claude Sonnet by default; /model to change
 	}, true
 }
+
+// ResolveCredentialSource reports whether a named subscription source resolves
+// to a live login right now. Used by the autonomous task runner as a PREFLIGHT:
+// a runtime that cannot authenticate is a runtime failure and may be swapped,
+// but only before any work has been done.
+//
+// It resolves rather than merely checking presence, because a stale token file
+// is present and useless, and finding that out after spawning a child is finding
+// it out too late.
+func ResolveCredentialSource(name string) (Endpoint, bool) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "":
+		return Endpoint{}, true // hosted: nothing to resolve
+	case "copilot":
+		return resolveCopilot()
+	case "codex":
+		return resolveCodex()
+	case "grok", "grok-sub":
+		return resolveGrok()
+	case "claude", "claude-sub":
+		return resolveClaudeSub()
+	}
+	return Endpoint{}, false
+}

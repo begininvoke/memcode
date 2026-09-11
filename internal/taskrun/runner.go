@@ -11,6 +11,8 @@ import (
 	"github.com/memcode-ai/memcode/internal/agent/permissions"
 	"github.com/memcode-ai/memcode/internal/config"
 	"github.com/memcode-ai/memcode/internal/jobs"
+	"github.com/memcode-ai/memcode/internal/provider"
+	"github.com/memcode-ai/memcode/internal/runtimes"
 	"github.com/memcode-ai/memcode/internal/task"
 	"github.com/memcode-ai/memcode/internal/taskgit"
 )
@@ -31,6 +33,10 @@ type Runner struct {
 	Spawn SpawnFunc
 	// HeartbeatEvery bounds how stale a live run's heartbeat can get.
 	HeartbeatEvery time.Duration
+	// Auth and Available answer "what is permitted" and "what is present".
+	// Injectable so a test's answer does not depend on the developer's laptop.
+	Auth      AuthSource
+	Available func() []string
 }
 
 // SpawnFunc executes a task's work and reports what happened.
@@ -49,6 +55,8 @@ type SpawnRequest struct {
 	Instructions string
 	Mode         permissions.Mode
 	ReadOnly     bool
+	// Env selects the resolved runtime for the child.
+	Env []string
 	// DenyTools and DenyCommands are the capability ceiling, projected from the
 	// task's grants. Both are real restrictions on the child.
 	DenyTools    []string
@@ -64,8 +72,8 @@ type SpawnResult struct {
 }
 
 // NewRunner builds a runner backed by real detached memcode processes.
-func NewRunner(store *Store) *Runner {
-	return &Runner{Store: store, Spawn: spawnJob, HeartbeatEvery: 20 * time.Second}
+func NewRunner(store *Store, auth AuthSource) *Runner {
+	return &Runner{Store: store, Spawn: spawnJob, HeartbeatEvery: 20 * time.Second, Auth: auth}
 }
 
 // Freeze captures a task's execution inputs as a Run, resolving everything that
@@ -84,6 +92,13 @@ func Freeze(t task.Task, root, triggerKind, triggerID string, now time.Time) (Ru
 // occurrence executed on Wednesday is occurredAt Monday: the ledger then says
 // which firing was recovered, instead of only when someone got round to it.
 func FreezeAt(t task.Task, root, triggerKind, triggerID string, occurredAt, now time.Time, backlog int) (Run, error) {
+	return FreezeWith(t, root, triggerKind, triggerID, occurredAt, now, backlog, runtimes.Resolution{})
+}
+
+// FreezeWith is FreezeAt plus the resolved runtime, frozen with everything else.
+func FreezeWith(t task.Task, root, triggerKind, triggerID string, occurredAt, now time.Time,
+	backlog int, rt runtimes.Resolution,
+) (Run, error) {
 	rev, err := t.Revision()
 	if err != nil {
 		return Run{}, err
@@ -105,22 +120,27 @@ func FreezeAt(t task.Task, root, triggerKind, triggerID string, occurredAt, now 
 		gs[i] = string(g)
 	}
 	return Run{
-		ID:          NewID(now),
-		Task:        t.Name,
-		Revision:    rev,
-		Definition:  string(def),
-		TriggerKind: triggerKind,
-		TriggerID:   triggerID,
-		Project:     project,
-		Grants:      gs,
-		Provider:    t.Agent.Provider,
-		Model:       t.Agent.Model,
-		Timeout:     t.Timeout(),
-		MaxCostUSD:  t.Limits.MaxCostUSD,
-		StartedAt:   now,
-		OccurredAt:  occurredAt,
-		Backlog:     backlog,
-		Seen:        SeenUnseen,
+		ID:               NewID(now),
+		Task:             t.Name,
+		Revision:         rev,
+		Definition:       string(def),
+		TriggerKind:      triggerKind,
+		TriggerID:        triggerID,
+		Project:          project,
+		Grants:           gs,
+		RuntimeRequested: string(rt.RequestedStrategy),
+		RuntimeResolved:  rt.Runtime,
+		ModelRequested:   rt.RequestedModel,
+		ModelResolved:    rt.Model,
+		CredSource:       rt.CredentialSource,
+		AuthID:           rt.AuthID,
+		AuthScope:        string(rt.AuthScope),
+		Timeout:          t.Timeout(),
+		MaxCostUSD:       t.Limits.MaxCostUSD,
+		StartedAt:        now,
+		OccurredAt:       occurredAt,
+		Backlog:          backlog,
+		Seen:             SeenUnseen,
 	}, nil
 }
 
@@ -141,13 +161,48 @@ func FreezeAt(t task.Task, root, triggerKind, triggerID string, occurredAt, now 
 // child was never given cannot be argued for.
 func modeFor(task.Task) permissions.Mode { return permissions.ModeAuto }
 
+// Authorizations supplies the machine's recorded runtime permissions.
+// Injectable so tests do not depend on whatever is installed on the developer's
+// laptop, and so the daemon and the CLI read the same store.
+type AuthSource func() runtimes.Authorizations
+
+// resolveRuntime decides where this task's inference runs, and refuses to
+// proceed when nothing is both authorized and capable. Resolution happens
+// BEFORE the run row is created, so the record carries the decision rather than
+// the run discovering it halfway through.
+func (r *Runner) resolveRuntime(t task.Task, runID string) (runtimes.Resolution, error) {
+	auth := runtimes.Authorizations(nil)
+	if r.Auth != nil {
+		auth = r.Auth()
+	}
+	avail := runtimes.Detect()
+	if r.Available != nil {
+		avail = r.Available()
+	}
+	return runtimes.Resolve(runtimes.Policy{
+		Strategy: runtimes.Strategy(t.Runtime.Strategy),
+		Allowed:  t.Runtime.Allowed,
+		Model:    t.Runtime.Model,
+		Fallback: t.Runtime.Fallback,
+	}, runtimes.Env{
+		Available:      avail,
+		Authorizations: auth,
+		Task:           t.Name,
+		Run:            runID,
+	})
+}
+
 // Start freezes, records and claims a run without executing it. Returns
 // ErrOccupied when the occurrence already belongs to another run.
 func (r *Runner) Start(ctx context.Context, t task.Task, root, triggerKind, triggerID string, now time.Time) (Run, error) {
 	if !t.IsEnabled() {
 		return Run{}, fmt.Errorf("task %q is disabled", t.Name)
 	}
-	frozen, err := Freeze(t, root, triggerKind, triggerID, now)
+	rt, err := r.resolveRuntime(t, "")
+	if err != nil {
+		return Run{}, err
+	}
+	frozen, err := FreezeWith(t, root, triggerKind, triggerID, now, now, 0, rt)
 	if err != nil {
 		return Run{}, err
 	}
@@ -279,6 +334,26 @@ func (r *Runner) execute(runCtx, storeCtx context.Context, run Run, t task.Task)
 		}
 	}
 
+	// RUNTIME PREFLIGHT. The resolved backend must actually work BEFORE the
+	// agent starts, because that is the only moment a substitution is honest.
+	// Once a runtime has run the task, any later failure belongs to the task.
+	if why, ok := runtimeUsable(run); !ok {
+		next := r.nextRuntime(t, run, why)
+		if next == "" {
+			res.Summary = "no usable runtime"
+			res.Detail = appendLine(res.Detail, fmt.Sprintf(
+				"Runtime %q could not be used (%s) and no authorized fallback remains.", run.RuntimeResolved, why))
+			res.ExecStatus, res.Outcome = ExecBlocked, OutcomeBlocked
+			return res
+		}
+		res.Detail = appendLine(res.Detail, fmt.Sprintf(
+			"Runtime %q was unusable (%s); fell back to %q.", run.RuntimeResolved, why, next))
+		run.RuntimeResolved = next
+		if rt, ok2 := runtimes.Get(next); ok2 {
+			run.CredSource = rt.CredentialSource
+		}
+	}
+
 	// WORK.
 	spawn, serr := r.Spawn(runCtx, SpawnRequest{
 		RunID:        run.ID,
@@ -287,6 +362,7 @@ func (r *Runner) execute(runCtx, storeCtx context.Context, run Run, t task.Task)
 		Instructions: t.Instructions,
 		Mode:         modeFor(t),
 		ReadOnly:     false,
+		Env:          runtimeEnv(run),
 		DenyTools:    cap.DenyTools,
 		DenyCommands: cap.DenyCommands,
 		Timeout:      run.Timeout,
@@ -448,6 +524,64 @@ func clip(s string, n int) string {
 	return s[:n] + "…"
 }
 
+// runtimeUsable checks that the chosen backend can actually be reached, before
+// any work starts. This is the ONLY place a runtime substitution may happen.
+//
+// After the agent has run, a failure belongs to the task, not the runtime.
+// Handing the same codebase to a different model because the tests failed is
+// not fallback — it is rerolling until something agrees, which converts one
+// honest failure into a search for a favourable opinion.
+func runtimeUsable(run Run) (string, bool) {
+	if run.CredSource == "" {
+		return "", true // the hosted gateway: reachability is the run's problem, not a selection one
+	}
+	if _, ok := provider.ResolveCredentialSource(run.CredSource); !ok {
+		return "the credential could not be resolved (signed out of the host tool, or the token expired)", false
+	}
+	return "", true
+}
+
+// nextRuntime returns the first authorized, capable fallback, or "".
+func (r *Runner) nextRuntime(t task.Task, run Run, _ string) string {
+	auth := runtimes.Authorizations(nil)
+	if r.Auth != nil {
+		auth = r.Auth()
+	}
+	avail := runtimes.Detect()
+	if r.Available != nil {
+		avail = r.Available()
+	}
+	chain := runtimes.Chain(runtimes.Policy{
+		Strategy: runtimes.Strategy(t.Runtime.Strategy),
+		Allowed:  t.Runtime.Allowed,
+		Model:    t.Runtime.Model,
+		Fallback: t.Runtime.Fallback,
+	}, runtimes.Env{Available: avail, Authorizations: auth, Task: t.Name, Run: run.ID},
+		run.RuntimeResolved)
+	if len(chain) == 0 {
+		return ""
+	}
+	return chain[0]
+}
+
+// runtimeEnv translates the frozen runtime decision into the environment the
+// child selects its backend from.
+//
+// The credential source is passed EXPLICITLY rather than letting the child
+// discover one: a detached process inheriting whatever ambient credential
+// happens to be configured would run wherever the machine felt like, which is
+// the opposite of a recorded, authorized decision.
+func runtimeEnv(run Run) []string {
+	var env []string
+	// Always set, even to empty: an empty value means "no subscription source",
+	// which must override an inherited one rather than fall through to it.
+	env = append(env, provider.EnvCredentialSource+"="+run.CredSource)
+	if run.ModelResolved != "" {
+		env = append(env, provider.EnvEndpointModel+"="+run.ModelResolved)
+	}
+	return env
+}
+
 // jobSpec builds the child's spawn spec. Split out and tested directly because
 // the real spawn path is the ONE part of a run that an injected fake executor
 // cannot cover — and a missing field here is invisible until it matters. It was:
@@ -466,6 +600,7 @@ func jobSpec(req SpawnRequest, workDir string) jobs.SpawnSpec {
 		ReadOnly:     req.ReadOnly,
 		ToolPolicy:   jobs.ToolPolicy{Disabled: req.DenyTools},
 		DenyCommands: req.DenyCommands,
+		Env:          req.Env,
 		ReportBack:   true,
 	}
 }

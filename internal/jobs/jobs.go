@@ -71,6 +71,11 @@ type SpawnSpec struct {
 	// its own log somewhere that gets deleted when the worktree is cleaned up.
 	// Empty means "same as Root".
 	WorkDir string
+	// Env are extra environment entries for the child ("KEY=value"), used to
+	// select the resolved execution runtime. A REAL selection, not metadata:
+	// without it the child would inherit the parent's ambient credential choice
+	// and quietly run somewhere the task never authorized.
+	Env []string
 }
 
 type Job struct {
@@ -223,6 +228,9 @@ func SpawnWithSpec(spec SpawnSpec) (Job, error) {
 	cmd.Stdout = logf
 	cmd.Stderr = logf
 	cmd.Stdin = nil
+	if len(spec.Env) > 0 {
+		cmd.Env = append(os.Environ(), spec.Env...)
+	}
 	if err := cmd.Start(); err != nil {
 		return Job{}, fmt.Errorf("starting job: %w", err)
 	}

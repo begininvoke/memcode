@@ -58,8 +58,8 @@ func TestDefaults(t *testing.T) {
 	tk := mustParse(t, minimal)
 	for _, c := range []struct{ got, want string }{
 		{string(tk.Execution.Mode), string(ModeAgent)},
-		{tk.Agent.Provider, ProviderSubscriptionPreferred},
-		{tk.Agent.Model, ModelAuto},
+		{tk.Runtime.Strategy, "prefer_authorized_subscription"},
+		{tk.Runtime.Model, ModelAuto},
 		{string(tk.Autonomy.Level), string(LevelBranch)},
 		{string(tk.Git.PullRequest), string(PRWhenChanges)},
 		{tk.Git.Branch, DefaultBranchPattern},
@@ -296,10 +296,13 @@ func TestRevisionChangesOnSemanticEdit(t *testing.T) {
 		"instructions": func(t *Task) { t.Instructions = "something else" },
 		"autonomy":     func(t *Task) { t.Autonomy.Level = LevelReadOnly },
 		"grant added":  func(t *Task) { t.Autonomy.Grants = []Grant{GrantGitCommit} },
-		"provider":     func(t *Task) { t.Agent.Provider = ProviderMemcode },
-		"trigger":      func(t *Task) { t.Triggers = []Trigger{{Every: "1h", Missed: MissedRunOnce}} },
-		"verify":       func(t *Task) { t.Verify.Commands = []string{"go test ./..."} },
-		"timeout":      func(t *Task) { t.Limits.Timeout = "2h" },
+		"runtime":      func(t *Task) { t.Runtime.Strategy = "hosted_only" },
+		"runtime order": func(t *Task) {
+			t.Runtime.Allowed = []string{"codex", "memcode-hosted"}
+		},
+		"trigger": func(t *Task) { t.Triggers = []Trigger{{Every: "1h", Missed: MissedRunOnce}} },
+		"verify":  func(t *Task) { t.Verify.Commands = []string{"go test ./..."} },
+		"timeout": func(t *Task) { t.Limits.Timeout = "2h" },
 	}
 	for name, edit := range edits {
 		t.Run(name, func(t *testing.T) {
@@ -442,5 +445,61 @@ func TestTimeoutFallsBackWhenAbsurd(t *testing.T) {
 	tk.Limits.Timeout = "nonsense"
 	if got := tk.Timeout(); got != 45*time.Minute {
 		t.Errorf("Timeout() = %v, want the 45m default", got)
+	}
+}
+
+// The runtime block defaults to naming every known backend in preference order,
+// which grants nothing: a named runtime is one the user could be ASKED about,
+// and nothing here is usable without a recorded authorization.
+func TestRuntimeDefaults(t *testing.T) {
+	tk := mustParse(t, minimal)
+	if tk.Runtime.Strategy != "prefer_authorized_subscription" {
+		t.Errorf("strategy = %q", tk.Runtime.Strategy)
+	}
+	if len(tk.Runtime.Allowed) == 0 {
+		t.Fatal("allowed should default to the known runtimes in order")
+	}
+	if tk.Runtime.Allowed[len(tk.Runtime.Allowed)-1] != "memcode-hosted" {
+		t.Errorf("allowed = %v, want the hosted gateway last", tk.Runtime.Allowed)
+	}
+	if len(tk.Runtime.Fallback) != 1 || tk.Runtime.Fallback[0] != "memcode-hosted" {
+		t.Errorf("fallback = %v, want the hosted gateway", tk.Runtime.Fallback)
+	}
+}
+
+func TestRuntimeValidation(t *testing.T) {
+	cases := []struct{ name, yaml, wantErr string }{
+		{"unknown strategy", "runtime:\n  strategy: vibes\n", "unknown runtime.strategy"},
+		{"unknown runtime", "runtime:\n  allowed: [\"gpt-telepathy\"]\n", "unknown runtime"},
+		{"unknown fallback", "runtime:\n  fallback: [\"nope\"]\n", "unknown runtime"},
+		{"explicit with no allowed", "runtime:\n  strategy: explicit\n  allowed: []\n", "needs runtime.allowed"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := parse(t, minimal+c.yaml)
+			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+				t.Errorf("err = %v, want one containing %q", err, c.wantErr)
+			}
+		})
+	}
+}
+
+// Changing where a task runs changes what the task IS, so the revision moves.
+func TestRuntimeChangesTheRevision(t *testing.T) {
+	base := mustParse(t, minimal)
+	baseRev, _ := base.Revision()
+	for name, edit := range map[string]func(*Task){
+		"strategy": func(t *Task) { t.Runtime.Strategy = "hosted_only" },
+		"order":    func(t *Task) { t.Runtime.Allowed = []string{"memcode-hosted"} },
+		"model":    func(t *Task) { t.Runtime.Model = "claude-sonnet-5" },
+		"fallback": func(t *Task) { t.Runtime.Fallback = []string{"codex", "memcode-hosted"} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			mod := base
+			edit(&mod)
+			if rev, _ := mod.Revision(); rev == baseRev {
+				t.Errorf("editing runtime.%s must change the revision", name)
+			}
+		})
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/memcode-ai/memcode/internal/agent/permissions"
+	"github.com/memcode-ai/memcode/internal/runtimes"
 	"github.com/memcode-ai/memcode/internal/task"
 )
 
@@ -72,9 +73,16 @@ func sample(t *testing.T, body string) task.Task {
 
 // runner wires a fake executor so the whole lifecycle is exercised without a
 // model call.
+// runner wires a fake executor and a FIXED runtime environment, so a test's
+// answer never depends on what happens to be installed on the machine running
+// it. Hosted-only by default: the point of most tests is not which backend.
 func runner(t *testing.T, s *Store, spawn SpawnFunc) *Runner {
 	t.Helper()
-	return &Runner{Store: s, Spawn: spawn, HeartbeatEvery: 10 * time.Millisecond}
+	return &Runner{
+		Store: s, Spawn: spawn, HeartbeatEvery: 10 * time.Millisecond,
+		Auth:      func() runtimes.Authorizations { return nil },
+		Available: func() []string { return nil },
+	}
 }
 
 func ok(text string) SpawnFunc {

@@ -25,6 +25,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/memcode-ai/memcode/internal/runtimes"
 )
 
 // Version is the schema version every task file must declare. An explicit
@@ -54,7 +56,7 @@ type Task struct {
 	Triggers     []Trigger   `yaml:"triggers,omitempty" json:"triggers,omitempty"`
 	Instructions string      `yaml:"instructions" json:"instructions"`
 	Execution    Execution   `yaml:"execution,omitempty" json:"execution"`
-	Agent        Agent       `yaml:"agent,omitempty" json:"agent"`
+	Runtime      Runtime     `yaml:"runtime,omitempty" json:"runtime"`
 	Autonomy     Autonomy    `yaml:"autonomy,omitempty" json:"autonomy"`
 	Git          Git         `yaml:"git,omitempty" json:"git"`
 	Verify       Verify      `yaml:"verify,omitempty" json:"verify"`
@@ -155,23 +157,27 @@ type Execution struct {
 // EscalateOnChanges is the only escalation condition implemented today.
 const EscalateOnChanges = "procedure_reports_changes"
 
-// Agent selects the EXECUTION BACKEND, not merely a model endpoint. A Codex or
-// Claude Code subscription can be an agent runtime whose operational behaviour
-// differs from the same vendor's raw API, so this is a provider choice with a
-// model inside it rather than a bare model name.
-type Agent struct {
-	Provider string `yaml:"provider,omitempty" json:"provider,omitempty"`
-	Model    string `yaml:"model,omitempty" json:"model,omitempty"`
+// Runtime is where the task's inference runs. It is four separate decisions
+// rather than one string, because "use my Claude subscription" quietly bundles
+// availability, permission, capability and what-to-do-when-it-breaks, and those
+// have different answers and different owners.
+//
+//	Strategy  how to choose
+//	Allowed   the user's ordered preference — order is obeyed, not optimized
+//	Model     a pinned catalog model, or auto
+//	Fallback  what may be tried when the RUNTIME fails (not when the task does)
+//
+// A runtime being present on the machine authorizes nothing. See
+// internal/runtimes.
+type Runtime struct {
+	Strategy string   `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+	Allowed  []string `yaml:"allowed,omitempty" json:"allowed,omitempty"`
+	Model    string   `yaml:"model,omitempty" json:"model,omitempty"`
+	Fallback []string `yaml:"fallback,omitempty" json:"fallback,omitempty"`
 }
 
-// ProviderSubscriptionPreferred picks the cheapest AUTHORIZED subscription
-// backend. Authorized, never merely present: a login living in another tool's
-// files is not consent to spend it unattended (see provider.credsource).
-const (
-	ProviderSubscriptionPreferred = "subscription-preferred"
-	ProviderMemcode               = "memcode"
-	ModelAuto                     = "auto"
-)
+// ModelAuto means the task expressed no model preference.
+const ModelAuto = "auto"
 
 // Autonomy is the task's authority CEILING. Level is a friendly preset that
 // expands to concrete grants; Grants adds named capabilities on top. The policy
@@ -324,11 +330,28 @@ func (t *Task) ApplyDefaults() {
 	if t.Execution.Mode == ModeHybrid && t.Execution.EscalateWhen == "" {
 		t.Execution.EscalateWhen = EscalateOnChanges
 	}
-	if t.Agent.Provider == "" {
-		t.Agent.Provider = ProviderSubscriptionPreferred
+	if t.Runtime.Strategy == "" {
+		t.Runtime.Strategy = string(runtimes.StrategyPreferAuthorized)
 	}
-	if t.Agent.Model == "" {
-		t.Agent.Model = ModelAuto
+	if len(t.Runtime.Allowed) == 0 && t.Runtime.Strategy != string(runtimes.StrategyExplicit) {
+		// Default preference: every subscription runtime, in registry order, then
+		// the hosted gateway. Nothing here is usable without an explicit
+		// authorization, so a default that NAMES subscriptions does not grant
+		// any — it only says which ones the user would be asked about.
+		//
+		// NOT filled for the explicit strategy. Defaulting there would make
+		// "require exactly this runtime" silently mean "require whatever happens
+		// to be first in the registry", which is the opposite of pinning one.
+		// Validation refuses the empty list instead.
+		for _, r := range runtimes.All() {
+			t.Runtime.Allowed = append(t.Runtime.Allowed, r.ID)
+		}
+	}
+	if t.Runtime.Model == "" {
+		t.Runtime.Model = ModelAuto
+	}
+	if len(t.Runtime.Fallback) == 0 {
+		t.Runtime.Fallback = []string{runtimes.Hosted}
 	}
 	if t.Autonomy.Level == "" {
 		t.Autonomy.Level = LevelBranch

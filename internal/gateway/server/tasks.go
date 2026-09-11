@@ -7,6 +7,7 @@ import (
 	"time"
 
 	gwconfig "github.com/memcode-ai/memcode/internal/gateway/config"
+	"github.com/memcode-ai/memcode/internal/runtimes"
 	"github.com/memcode-ai/memcode/internal/task"
 	"github.com/memcode-ai/memcode/internal/taskrun"
 )
@@ -51,7 +52,19 @@ func (r *runtime) taskPollLoop(ctx context.Context, out io.Writer) {
 		fmt.Fprintf(out, "gateway: %d task run(s) interrupted by an earlier exit\n", n)
 	}
 
-	runner := taskrun.NewRunner(store)
+	// The daemon reads the same authorization store the CLI writes, so a
+	// permission granted at a terminal is the permission used at 3am.
+	runner := taskrun.NewRunner(store, func() runtimes.Authorizations {
+		s := r.cfg()
+		out := make(runtimes.Authorizations, 0, len(s.AuthorizedRuntimes))
+		for _, g := range s.AuthorizedRuntimes {
+			out = append(out, runtimes.Grant{
+				ID: g.ID, Runtime: g.Runtime, Scope: runtimes.Scope(g.Scope),
+				Task: g.Task, Run: g.Run, GrantedAt: g.GrantedAt, Revoked: g.Revoked,
+			})
+		}
+		return out
+	})
 	tick := time.NewTicker(taskPollEvery)
 	defer tick.Stop()
 
