@@ -136,6 +136,16 @@ type Run struct {
 	ResultRev string
 	Changed   bool
 
+	// What was published, and which artifacts this run created rather than
+	// found already there.
+	Remote        string
+	CommitSHA     string
+	PRNumber      int
+	PRURL         string
+	CreatedBranch bool
+	CreatedCommit bool
+	CreatedPR     bool
+
 	Host string
 	PID  int
 
@@ -194,7 +204,16 @@ CREATE TABLE IF NOT EXISTS runs (
   branch        TEXT NOT NULL DEFAULT '',
   base_rev      TEXT NOT NULL DEFAULT '',
   result_rev    TEXT NOT NULL DEFAULT '',
-  changed       INTEGER NOT NULL DEFAULT 0
+  changed       INTEGER NOT NULL DEFAULT 0,
+  -- What the run published, and what it CREATED as opposed to reused. The
+  -- distinction matters on a retry: reusing a branch is not making one.
+  remote          TEXT NOT NULL DEFAULT '',
+  commit_sha      TEXT NOT NULL DEFAULT '',
+  pr_number       INTEGER NOT NULL DEFAULT 0,
+  pr_url          TEXT NOT NULL DEFAULT '',
+  created_branch  INTEGER NOT NULL DEFAULT 0,
+  created_commit  INTEGER NOT NULL DEFAULT 0,
+  created_pr      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS runs_by_task ON runs(task, started_at DESC);
 CREATE INDEX IF NOT EXISTS runs_by_seen ON runs(seen, started_at DESC);
@@ -268,6 +287,13 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		`ALTER TABLE runs ADD COLUMN base_rev TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE runs ADD COLUMN result_rev TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE runs ADD COLUMN changed INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE runs ADD COLUMN remote TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE runs ADD COLUMN commit_sha TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE runs ADD COLUMN pr_number INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE runs ADD COLUMN pr_url TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE runs ADD COLUMN created_branch INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE runs ADD COLUMN created_commit INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE runs ADD COLUMN created_pr INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := db.ExecContext(ctx, stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migrating task ledger: %w", err)
@@ -389,16 +415,27 @@ type Result struct {
 	BaseRev      string
 	ResultRev    string
 	Changed      bool
+
+	Remote        string
+	CommitSHA     string
+	PRNumber      int
+	PRURL         string
+	CreatedBranch bool
+	CreatedCommit bool
+	CreatedPR     bool
 }
 
 // FinishResult closes a run with its full structured verdict.
 func (s *Store) FinishResult(ctx context.Context, id string, r Result, now time.Time) error {
 	if _, err := s.db.ExecContext(ctx, `
 		UPDATE runs SET exec_status=?, verify_status=?, checks=?, worktree=?, branch=?,
-		                base_rev=?, result_rev=?, changed=?
+		                base_rev=?, result_rev=?, changed=?, remote=?, commit_sha=?,
+		                pr_number=?, pr_url=?, created_branch=?, created_commit=?, created_pr=?
 		WHERE id=? AND state<>?`,
 		string(r.ExecStatus), string(r.VerifyStatus), r.Checks, r.Worktree, r.Branch,
-		r.BaseRev, r.ResultRev, r.Changed, id, string(StateDone)); err != nil {
+		r.BaseRev, r.ResultRev, r.Changed, r.Remote, r.CommitSHA,
+		r.PRNumber, r.PRURL, r.CreatedBranch, r.CreatedCommit, r.CreatedPR,
+		id, string(StateDone)); err != nil {
 		return err
 	}
 	return s.Finish(ctx, id, r.Outcome, r.Summary, r.Detail, r.LogPath, now)
@@ -544,7 +581,8 @@ func (s *Store) Reconcile(ctx context.Context, now time.Time) (int, error) {
 const cols = `id, task, revision, definition, trigger_kind, trigger_id, project, grants,
 	provider, model, timeout_ns, max_cost_usd, state, outcome, summary, detail, log_path,
 	host, pid, started_at, heartbeat_at, finished_at, seen, backlog, occurred_at,
-	exec_status, verify_status, checks, worktree, branch, base_rev, result_rev, changed`
+	exec_status, verify_status, checks, worktree, branch, base_rev, result_rev, changed,
+	remote, commit_sha, pr_number, pr_url, created_branch, created_commit, created_pr`
 
 func (s *Store) query(ctx context.Context, q string, args ...any) ([]Run, error) {
 	rows, err := s.db.QueryContext(ctx, q, args...)
@@ -562,7 +600,9 @@ func (s *Store) query(ctx context.Context, q string, args ...any) ([]Run, error)
 			&r.Outcome, &r.Summary, &r.Detail, &r.LogPath, &r.Host, &r.PID,
 			&started, &heartbeat, &finished, &r.Seen, &r.Backlog, &occurred,
 			&r.ExecStatus, &r.VerifyStatus, &r.Checks, &r.Worktree, &r.Branch,
-			&r.BaseRev, &r.ResultRev, &r.Changed); err != nil {
+			&r.BaseRev, &r.ResultRev, &r.Changed,
+			&r.Remote, &r.CommitSHA, &r.PRNumber, &r.PRURL,
+			&r.CreatedBranch, &r.CreatedCommit, &r.CreatedPR); err != nil {
 			return nil, err
 		}
 		if grants != "" {

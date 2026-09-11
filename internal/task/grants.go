@@ -20,6 +20,14 @@ import (
 // construction. The runtime floor (permissions.Decide returning NeedPrompt for
 // anything catastrophic, in every mode) still sits underneath all of this.
 
+// BACKLOG: the vocabulary does not yet describe read-only EXTERNAL access.
+// A task that reads a security advisory feed or a vendor's pricing page depends
+// today on the `web` toolset happening to be present, which makes network reach
+// an implicit consequence of tool packaging rather than a stated capability.
+// A `network.read` grant (and eventually its write counterpart, which no tier
+// would include) should make that explicit, so the grant list describes the
+// actual authority surface instead of most of it.
+
 // Grant is one named capability an autonomous run may exercise.
 type Grant string
 

@@ -190,9 +190,14 @@ type Autonomy struct {
 type PRMode string
 
 const (
-	PRNever       PRMode = "never"
+	PRNever PRMode = "never"
+	// PRWhenChanges opens a pull request when the run produced a commit.
 	PRWhenChanges PRMode = "when_changes"
-	PRAlways      PRMode = "always"
+	// PRAlways means always FOR A PRODUCED COMMIT — never "manufacture an empty
+	// one to satisfy the configuration". A run with no diff opens nothing under
+	// either setting; the difference between them is reserved for future
+	// conditions on an actual change, not for inventing artifacts.
+	PRAlways PRMode = "always"
 )
 
 // Git controls how code changes leave an unattended run. Worktree isolation is
@@ -202,6 +207,8 @@ type Git struct {
 	Worktree    *bool  `yaml:"worktree,omitempty" json:"worktree,omitempty"`
 	PullRequest PRMode `yaml:"pull_request,omitempty" json:"pull_request,omitempty"`
 	Branch      string `yaml:"branch,omitempty" json:"branch,omitempty"`
+	// Remote is where a branch is published. Default origin.
+	Remote string `yaml:"remote,omitempty" json:"remote,omitempty"`
 }
 
 // DefaultBranchPattern names the branch an autonomous run pushes. {name} and
@@ -344,6 +351,9 @@ func (t *Task) ApplyDefaults() {
 	}
 	if t.Git.Branch == "" {
 		t.Git.Branch = DefaultBranchPattern
+	}
+	if t.Git.Remote == "" {
+		t.Git.Remote = "origin"
 	}
 	if t.Delivery.Desktop == "" {
 		t.Delivery.Desktop = NotifyFailures

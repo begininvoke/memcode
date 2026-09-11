@@ -414,9 +414,13 @@ var taskHistoryCmd = &cobra.Command{
 			if !r.FinishedAt.IsZero() {
 				took = r.FinishedAt.Sub(r.StartedAt).Round(time.Second).String()
 			}
+			note := r.Summary
+			if r.PRURL != "" {
+				note = r.PRURL + "  " + note
+			}
 			fmt.Printf("  %s %-16s %-22s %-8s %-7s %s\n",
 				outcomeMark(r.Outcome), r.Outcome, r.Task,
-				r.StartedAt.Local().Format("Jan 02 15:04"), took, r.Summary)
+				r.StartedAt.Local().Format("Jan 02 15:04"), took, note)
 		}
 		return nil
 	},
@@ -513,6 +517,39 @@ var taskShowRunCmd = &cobra.Command{
 		if !r.FinishedAt.IsZero() {
 			fmt.Printf("  finished    %s (%s)\n", r.FinishedAt.Local().Format(time.RFC3339),
 				r.FinishedAt.Sub(r.StartedAt).Round(time.Second))
+		}
+		if r.ExecStatus != "" {
+			fmt.Printf("  execution   %s\n", r.ExecStatus)
+		}
+		if r.VerifyStatus != "" {
+			fmt.Printf("  verification %s\n", r.VerifyStatus)
+		}
+		if r.Branch != "" {
+			fmt.Printf("  branch      %s", r.Branch)
+			if r.CreatedBranch {
+				fmt.Printf(" (created by this run)")
+			}
+			fmt.Println()
+		}
+		if r.BaseRev != "" {
+			fmt.Printf("  base        %s\n", r.BaseRev)
+		}
+		if r.CommitSHA != "" {
+			fmt.Printf("  commit      %s", r.CommitSHA)
+			if r.CreatedCommit {
+				fmt.Printf(" (created by this run)")
+			}
+			fmt.Println()
+		}
+		if r.PRURL != "" {
+			fmt.Printf("  pull request %s", r.PRURL)
+			if r.CreatedPR {
+				fmt.Printf(" (opened by this run)")
+			}
+			fmt.Println()
+		}
+		if r.Worktree != "" {
+			fmt.Printf("  worktree    %s (kept for inspection)\n", r.Worktree)
 		}
 		if r.LogPath != "" {
 			fmt.Printf("  log         %s\n", r.LogPath)

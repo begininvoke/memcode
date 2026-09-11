@@ -172,26 +172,28 @@ verify:
 	}
 }
 
-// A successful run cleans up after itself.
-func TestSuccessfulRunCleansItsWorktree(t *testing.T) {
+// A run with nothing to lose cleans up after itself. Retention is decided by
+// whether the work is recoverable elsewhere, not by whether the outcome reads
+// nicely — see TestLocalOnlyRepoCommitsAndKeepsTheWork for the other side.
+func TestNoChangeRunCleansItsWorktree(t *testing.T) {
 	s := store(t)
 	ctx := context.Background()
 	tk := sample(t, `version: 1
 name: tidy
-instructions: change something
+instructions: look around
 verify:
   commands:
     - "true"
 `)
-	run, err := runner(t, s, changing("done")).Run(ctx, tk, repo(t), TriggerManual, "")
+	run, err := runner(t, s, ok("nothing to do here")).Run(ctx, tk, repo(t), TriggerManual, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if run.Outcome != OutcomeSuccess {
-		t.Fatalf("outcome = %q, want success", run.Outcome)
+	if run.Outcome != OutcomeNoChange {
+		t.Fatalf("outcome = %q, want no_change", run.Outcome)
 	}
 	if run.Worktree != "" {
-		t.Errorf("a successful run's worktree should be cleaned, got %q", run.Worktree)
+		t.Errorf("a run that changed nothing should clean its worktree, got %q", run.Worktree)
 	}
 	if run.BaseRev == "" || run.Branch == "" {
 		t.Error("base revision and branch must still be recorded after cleanup")

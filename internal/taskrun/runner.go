@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/memcode-ai/memcode/internal/agent/permissions"
+	"github.com/memcode-ai/memcode/internal/config"
 	"github.com/memcode-ai/memcode/internal/jobs"
 	"github.com/memcode-ai/memcode/internal/task"
 	"github.com/memcode-ai/memcode/internal/taskgit"
@@ -230,6 +231,12 @@ func (r *Runner) execute(runCtx, storeCtx context.Context, run Run, t task.Task)
 		return res
 	}
 
+	// memcode's own state must not turn up in the user's `git status`. An
+	// interactive session does this at launch; an unattended run may be the
+	// first thing that ever touches this repo, so it does it too. Idempotent,
+	// and a no-op when .memcode does not exist.
+	config.EnsureGitignore(run.Project)
+
 	// ISOLATE. Every autonomous run works somewhere that is not the user's
 	// checkout: a mutating one needs a branch to build on, and a read-only one
 	// still needs its test caches to land off the tree someone is sitting in.
@@ -263,10 +270,11 @@ func (r *Runner) execute(runCtx, storeCtx context.Context, run Run, t task.Task)
 			// worktree is the evidence someone is about to ask for, and deleting
 			// it to stay tidy destroys it.
 			defer func() {
-				if res.Outcome == OutcomeSuccess || res.Outcome == OutcomeNoChange {
-					_ = taskgit.Remove(storeCtx, wt)
-					res.Worktree = ""
+				if keepWorktree(res) {
+					return
 				}
+				_ = taskgit.Remove(storeCtx, wt)
+				res.Worktree = ""
 			}()
 		}
 	}
@@ -323,6 +331,22 @@ func (r *Runner) execute(runCtx, storeCtx context.Context, run Run, t task.Task)
 	if res.VerifyStatus == VerifyFail {
 		res.Summary = "verification failed"
 	}
+
+	// PUBLISH. Only a verified change is offered for review: publishing work
+	// whose tests failed would put a broken branch in front of someone as if it
+	// were ready. A failure keeps its worktree instead, which is where the
+	// evidence is.
+	if wt.Path != "" && res.OKOutcome() && res.Changed {
+		r.publish(storeCtx, run, t, wt, &res)
+		if res.PRURL != "" {
+			res.Summary = fmt.Sprintf("%s (%s)", res.Summary, res.PRURL)
+		}
+	}
+	if strings.TrimSpace(res.Summary) == "" {
+		// An agent that finished without a closing line still needs a legible
+		// row in the history and the inbox.
+		res.Summary = defaultSummary(res)
+	}
 	if res.Checks != "" {
 		res.Detail = strings.TrimSpace(res.Detail + "\n\n" + res.Checks)
 	}
@@ -330,6 +354,24 @@ func (r *Runner) execute(runCtx, storeCtx context.Context, run Run, t task.Task)
 		res.Detail = strings.TrimSpace(res.Detail + "\n\nWorktree kept for inspection: " + res.Worktree)
 	}
 	return res
+}
+
+// defaultSummary describes a run that said nothing about itself, from what it
+// actually did.
+func defaultSummary(res Result) string {
+	switch {
+	case res.PRURL != "":
+		return "opened " + res.PRURL
+	case res.CommitSHA != "" && res.CreatedBranch:
+		return fmt.Sprintf("pushed %s to %s", short(res.CommitSHA), res.Branch)
+	case res.CommitSHA != "":
+		return fmt.Sprintf("committed %s on %s", short(res.CommitSHA), res.Branch)
+	case res.Changed:
+		return "changed files"
+	case res.Outcome == OutcomeNoChange:
+		return "nothing to change"
+	}
+	return string(res.Outcome)
 }
 
 // OKOutcome reports whether the result is one nobody needs to look at.
