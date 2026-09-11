@@ -186,6 +186,13 @@ for local gateway development. Never store keys in .memcode.`,
 		// --allow-tools/--deny-tools: a delegated job's actual toolset restriction
 		// (see jobs.SpawnSpec.ToolPolicy). Applied here — before the --job branch —
 		// so it binds regardless of whether the child also carries --session.
+		// --read-only: explorer mode, the read-only tool whitelist. Applied with
+		// the tool policy because it is the same kind of restriction — what the
+		// child CAN do, decided before it starts, rather than what it may be
+		// talked into at the gate.
+		if ro, _ := cmd.Flags().GetBool("read-only"); ro {
+			sess.SetReadOnly(true)
+		}
 		allowTools, _ := cmd.Flags().GetString("allow-tools")
 		denyTools, _ := cmd.Flags().GetString("deny-tools")
 		if allowTools != "" || denyTools != "" {
@@ -362,6 +369,8 @@ func init() {
 	_ = runCmd.Flags().MarkHidden("allow-tools")
 	runCmd.Flags().String("deny-tools", "", "internal: comma-separated toolset/tool deny-list for a delegated job (deny wins)")
 	_ = runCmd.Flags().MarkHidden("deny-tools")
+	runCmd.Flags().Bool("read-only", false, "internal: explorer mode — read-only tools only, no edits and no bash")
+	_ = runCmd.Flags().MarkHidden("read-only")
 	runCmd.Flags().String("model", "", "model for this run (a catalog label like sonnet or opus); overrides the remembered pin without changing it")
 	runCmd.Flags().String("browser-session", "", "internal: \"existing_chrome\" attaches this run to the user's own already-running Chrome via the gateway browser broker (fails closed, never falls back to ephemeral)")
 	_ = runCmd.Flags().MarkHidden("browser-session")

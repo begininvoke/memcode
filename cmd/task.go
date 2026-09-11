@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,7 +13,37 @@ import (
 
 	"github.com/memcode-ai/memcode/internal/config"
 	"github.com/memcode-ai/memcode/internal/task"
+	"github.com/memcode-ai/memcode/internal/taskrun"
 )
+
+// openRuns opens the run ledger and settles anything a dead process left
+// behind. Reconciling on every open means an interrupted run is discovered the
+// next time anyone looks, rather than sitting as "running" forever.
+func openRuns(ctx context.Context) (*taskrun.Store, error) {
+	s, err := taskrun.OpenDefault(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.Reconcile(ctx, time.Now()); err != nil {
+		s.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// outcomeMark is the one-glyph verdict used in listings.
+func outcomeMark(o taskrun.Outcome) string {
+	switch o {
+	case taskrun.OutcomeSuccess, taskrun.OutcomeNoChange:
+		return "OK"
+	case taskrun.OutcomeNeedsAttention:
+		return "!!"
+	case taskrun.OutcomeInterrupted:
+		return ".."
+	default:
+		return "XX"
+	}
+}
 
 var taskCmd = &cobra.Command{
 	Use:     "task",
@@ -257,7 +288,206 @@ is silently not running rather than loudly broken.`,
 	},
 }
 
+var taskRunCmd = &cobra.Command{
+	Use:   "run <name>",
+	Short: "Run a task now and record the result",
+	Long: `Runs a task immediately, in the foreground, and writes a durable run record.
+
+This is the ordinary way to use a task, not a way to test one. A task is a runnable object;
+attaching a trigger is what makes it also happen on its own.
+
+The run freezes its inputs when it starts — the definition and its revision, the resolved
+project, the expanded authority, the runtime, the limits — so editing the task file while it
+runs cannot change what the run meant.`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := cmd.Context()
+		root := taskRoot()
+		t, err := task.Get(root, args[0], time.Now())
+		if err != nil {
+			return err
+		}
+		store, err := openRuns(ctx)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+
+		// Refuse to pile a second run onto a task that is already going. The full
+		// concurrency policy (queue vs skip, per project) lands with triggers;
+		// this is the floor that stops the obvious foot-gun.
+		if active, err := store.Active(ctx, t.Name); err == nil && len(active) > 0 {
+			return fmt.Errorf("%s is already running (%s) — wait for it or stop that process",
+				t.Name, active[0].ID)
+		}
+
+		fmt.Printf("%s · %s · %s\n", t.Name, t.Autonomy.Level, t.Agent.Provider)
+		run, err := taskrun.NewRunner(store).Run(ctx, t, root, taskrun.TriggerManual, "")
+		if err != nil {
+			return err
+		}
+		fmt.Printf("\n%s  %s  %s\n", outcomeMark(run.Outcome), run.Outcome, run.Summary)
+		fmt.Printf("   run %s · %s\n", run.ID, run.Revision)
+		if run.LogPath != "" {
+			fmt.Printf("   log %s\n", run.LogPath)
+		}
+		if run.Detail != "" && run.Outcome != taskrun.OutcomeSuccess {
+			fmt.Printf("\n%s\n", run.Detail)
+		}
+		if !run.OK() {
+			return fmt.Errorf("task %s: %s", t.Name, run.Outcome)
+		}
+		return nil
+	},
+}
+
+var taskHistoryCmd = &cobra.Command{
+	Use:     "history [name]",
+	Aliases: []string{"runs"},
+	Short:   "Show past runs, newest first",
+	Args:    cobra.MaximumNArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := cmd.Context()
+		store, err := openRuns(ctx)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		var name string
+		if len(args) == 1 {
+			name = args[0]
+		}
+		runs, err := store.Recent(ctx, name, 30)
+		if err != nil {
+			return err
+		}
+		if len(runs) == 0 {
+			fmt.Println("No runs yet.")
+			return nil
+		}
+		for _, r := range runs {
+			took := ""
+			if !r.FinishedAt.IsZero() {
+				took = r.FinishedAt.Sub(r.StartedAt).Round(time.Second).String()
+			}
+			fmt.Printf("  %s %-16s %-22s %-8s %-7s %s\n",
+				outcomeMark(r.Outcome), r.Outcome, r.Task,
+				r.StartedAt.Local().Format("Jan 02 15:04"), took, r.Summary)
+		}
+		return nil
+	},
+}
+
+var taskInboxCmd = &cobra.Command{
+	Use:   "inbox",
+	Short: "Show runs you have not looked at yet",
+	Long: `The inbox is the durable ledger of autonomous activity. Every run lands here whether
+or not anyone was watching; other delivery (a PR, a chat message, a desktop notification) is
+notification layered on top of it, never a replacement.
+
+Listing marks runs as seen. Seen is not the same as dealt with: use ` + "`task ack`" + ` for that.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := cmd.Context()
+		store, err := openRuns(ctx)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		runs, err := store.Unseen(ctx, 50)
+		if err != nil {
+			return err
+		}
+		if len(runs) == 0 {
+			fmt.Println("Nothing new.")
+			return nil
+		}
+		fmt.Printf("Autonomous activity — %d run(s) since you last looked\n", len(runs))
+		ids := make([]string, 0, len(runs))
+		for _, r := range runs {
+			fmt.Printf("  %s %-22s %-16s %s\n", outcomeMark(r.Outcome), r.Task, r.Outcome, r.Summary)
+			ids = append(ids, r.ID)
+		}
+		needs := 0
+		for _, r := range runs {
+			if r.Outcome == taskrun.OutcomeNeedsAttention {
+				needs++
+			}
+		}
+		if needs > 0 {
+			fmt.Printf("\n%d need your attention — `memcode task show-run <id>` for the detail.\n", needs)
+		}
+		return store.MarkSeen(ctx, ids)
+	},
+}
+
+var taskAckCmd = &cobra.Command{
+	Use:   "ack <run-id>",
+	Short: "Mark a run as dealt with",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := cmd.Context()
+		store, err := openRuns(ctx)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		if err := store.Acknowledge(ctx, args[0]); err != nil {
+			return err
+		}
+		fmt.Printf("acknowledged %s\n", args[0])
+		return nil
+	},
+}
+
+var taskShowRunCmd = &cobra.Command{
+	Use:   "show-run <run-id>",
+	Short: "Show one run in full, including the definition it froze",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := cmd.Context()
+		store, err := openRuns(ctx)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		r, err := store.Get(ctx, args[0])
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%s\n", r.ID)
+		fmt.Printf("  task        %s\n", r.Task)
+		fmt.Printf("  revision    %s\n", r.Revision)
+		fmt.Printf("  trigger     %s", r.TriggerKind)
+		if r.TriggerID != "" {
+			fmt.Printf(" (%s)", r.TriggerID)
+		}
+		fmt.Printf("\n  project     %s\n", r.Project)
+		fmt.Printf("  runtime     %s / %s\n", r.Provider, r.Model)
+		fmt.Printf("  authority   %s\n", strings.Join(r.Grants, ", "))
+		fmt.Printf("  state       %s / %s (%s)\n", r.State, r.Outcome, r.Seen)
+		fmt.Printf("  started     %s\n", r.StartedAt.Local().Format(time.RFC3339))
+		if !r.FinishedAt.IsZero() {
+			fmt.Printf("  finished    %s (%s)\n", r.FinishedAt.Local().Format(time.RFC3339),
+				r.FinishedAt.Sub(r.StartedAt).Round(time.Second))
+		}
+		if r.LogPath != "" {
+			fmt.Printf("  log         %s\n", r.LogPath)
+		}
+		if r.Summary != "" {
+			fmt.Printf("\n  %s\n", r.Summary)
+		}
+		if r.Detail != "" {
+			fmt.Printf("\n%s\n", r.Detail)
+		}
+		// The frozen definition is the whole point of the record: it is what this
+		// run actually ran, regardless of what the file says now.
+		fmt.Printf("\n--- definition as frozen at run time ---\n%s", r.Definition)
+		return nil
+	},
+}
+
 func init() {
-	taskCmd.AddCommand(taskListCmd, taskShowCmd, taskCheckCmd)
+	taskCmd.AddCommand(taskListCmd, taskShowCmd, taskCheckCmd,
+		taskRunCmd, taskHistoryCmd, taskInboxCmd, taskAckCmd, taskShowRunCmd)
 	rootCmd.AddCommand(taskCmd)
 }

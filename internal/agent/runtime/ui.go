@@ -193,6 +193,14 @@ func (s *Session) SetBrowserHeadless(on bool) { s.browserHeadless = on }
 // — a tool that can never run must not be offered.
 func (s *Session) SetNoApprover(on bool) { s.noApprover = on }
 
+// SetReadOnly puts the session in explorer mode: the read-only tool whitelist,
+// no edit_file and no bash. This is a CAPABILITY restriction, not a permission
+// one, and that distinction is the point — the permission gate can be argued
+// past (the authorization judge downgrades a prompt to an allow when the
+// request plainly asked for the action), but a tool the session was never given
+// cannot be reached at all.
+func (s *Session) SetReadOnly(on bool) { s.readOnly = on }
+
 // SetEffortOverride forces the per-turn thinking effort from the /effort command: "off",
 // "medium", or "high" pin it every turn; "auto" (or anything else) clears the override and
 // returns to the per-turn heuristic (effortForTurn). EffortOverride reports the current setting.

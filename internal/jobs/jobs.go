@@ -54,6 +54,13 @@ type SpawnSpec struct {
 	ResourceGrant                                                                                             ResourceGrant
 	Budgets                                                                                                   ExecutionBudgets
 	ReportBack                                                                                                bool
+	// ReadOnly puts the child in explorer mode: the read-only tool whitelist, no
+	// edits and no bash. A capability the child does not have cannot be talked
+	// past, which matters because the permission gate alone is not enough here —
+	// the authorization judge can downgrade a prompt to an allow when the task
+	// text plainly asks for the action, and a task's instructions ALWAYS ask for
+	// the task's own work.
+	ReadOnly bool
 }
 
 type Job struct {
@@ -181,6 +188,9 @@ func SpawnWithSpec(spec SpawnSpec) (Job, error) {
 	}
 	if len(spec.ToolPolicy.Disabled) > 0 {
 		argv = append(argv, "--deny-tools", strings.Join(spec.ToolPolicy.Disabled, ","))
+	}
+	if spec.ReadOnly {
+		argv = append(argv, "--read-only")
 	}
 	if isTestBinary(self) {
 		// Under `go test`, os.Executable() is the package's TEST binary, not memcode.
