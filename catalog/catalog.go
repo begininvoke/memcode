@@ -59,6 +59,14 @@ type CatalogModel struct {
 	// Empty means "no floor": send whatever the effort maps to.
 	MinReasoningEffort string `json:"min_reasoning_effort,omitempty"`
 
+	// Aliases are RETIRED labels and ids that must keep resolving to this entry.
+	// When a vendor decommissions a model, deleting its row would make every pin
+	// naming it a hard "unknown model" 400 at the gateway; listing the dead name
+	// here migrates those pins onto the replacement instead, which is exactly
+	// what the vendor's own migration does. A real label always wins over an
+	// alias, so an alias can never shadow a live model.
+	Aliases []string `json:"aliases,omitempty"`
+
 	// Fallback is the model's mid-turn failure chain, in LABELS: who covers
 	// when this model errors after transport retries, walked IN ORDER by the
 	// CLI's recovery executor (availability/billing filtering happens at walk
@@ -130,6 +138,7 @@ type loadedCatalog struct {
 	file    catalogFile
 	byID    map[string]CatalogModel
 	byLabel map[string]CatalogModel
+	byAlias map[string]CatalogModel
 }
 
 func mustLoadModelCatalog(data []byte) *loadedCatalog {
@@ -141,6 +150,7 @@ func mustLoadModelCatalog(data []byte) *loadedCatalog {
 		file:    f,
 		byID:    make(map[string]CatalogModel, len(f.Models)),
 		byLabel: make(map[string]CatalogModel, len(f.Models)),
+		byAlias: make(map[string]CatalogModel),
 	}
 	for _, m := range f.Models {
 		c.byID[m.ID] = m
@@ -153,6 +163,20 @@ func mustLoadModelCatalog(data []byte) *loadedCatalog {
 			panic(fmt.Sprintf("common: duplicate model label %q in models.json", m.Label))
 		}
 		c.byLabel[m.Label] = m
+	}
+	// Aliases resolve in a SEPARATE pass and a separate map: a retired name must
+	// never shadow a live label, and two dead models may legitimately migrate to
+	// the same replacement.
+	for _, m := range f.Models {
+		for _, a := range m.Aliases {
+			if _, live := c.byID[a]; live {
+				panic(fmt.Sprintf("common: alias %q on %q is a live model id", a, m.ID))
+			}
+			if _, live := c.byLabel[a]; live {
+				panic(fmt.Sprintf("common: alias %q on %q is a live model label", a, m.ID))
+			}
+			c.byAlias[a] = m
+		}
 	}
 	return c
 }
@@ -203,7 +227,10 @@ func LookupModel(idOrLabel string) (CatalogModel, bool) {
 	if m, ok := modelCatalog.byID[idOrLabel]; ok {
 		return m, true
 	}
-	m, ok := modelCatalog.byLabel[idOrLabel]
+	if m, ok := modelCatalog.byLabel[idOrLabel]; ok {
+		return m, true
+	}
+	m, ok := modelCatalog.byAlias[idOrLabel]
 	return m, ok
 }
 

@@ -26,7 +26,9 @@ func TestModelPricingRealIDs(t *testing.T) {
 		{"accounts/fireworks/models/kimi-k3", 3.00, 15.00}, // K3's own Fireworks headline card ($3/$15), NOT the kimi family rule
 		{"accounts/fireworks/models/qwen3p8-max", 2.00, 6.00},
 		{"accounts/fireworks/models/qwen3p8-2p4t-a95b", 2.00, 6.00}, // legacy path
-		{"accounts/fireworks/models/deepseek-v4-pro-0813", 1.32, 3.96},
+		// Decommissioned 2026-09-25 and aliased onto V4.1 Flash, so they price as Flash.
+		{"accounts/fireworks/models/deepseek-v4-pro-0813", 0.22, 0.66},
+		{"deepseek-v4-pro", 0.22, 0.66},
 		{"accounts/fireworks/models/deepseek-v4p1-flash", 0.22, 0.66},
 		// Superseded but still deployed on Fireworks: without its own rate row this
 		// falls to the $1.40/$4.40 Fireworks floor and bills 6x.
@@ -62,7 +64,8 @@ func TestModelPricingByLabel(t *testing.T) {
 	}{
 		{"sol", 5}, {"terra", 2}, {"luna", 0.2},
 		{"glm-5p2", 1.40}, {"kimi-k3", 3.00}, {"qwen3p8-max", 2.00},
-		{"deepseek-v4-pro", 1.32}, {"deepseek-v4-flash", 0.22},
+		// deepseek-v4-pro is an alias onto V4.1 Flash as of the 2026-09-25 decommission.
+		{"deepseek-v4-pro", 0.22}, {"deepseek-v4-flash", 0.22},
 		{"gemini-flash-lite", 0.3},
 	}
 	for _, c := range cases {
@@ -71,8 +74,9 @@ func TestModelPricingByLabel(t *testing.T) {
 		}
 	}
 	// Windows resolve by label too (the footer meter sees labels, not raw ids).
-	if got := ContextWindow("glm-5p2"); got != 1_000_000 {
-		t.Errorf("ContextWindow(label glm-5p2) = %d, want 1M", got)
+	// glm-5p2 is an alias onto GLM 5.3, whose window is 1,048,576.
+	if got := ContextWindow("glm-5p2"); got != 1_048_576 {
+		t.Errorf("ContextWindow(label glm-5p2) = %d, want 1048576", got)
 	}
 	if got := ContextWindow("qwen3p8-max"); got != 262_144 {
 		t.Errorf("ContextWindow(label qwen3p8-max) = %d, want 262144", got)
@@ -84,7 +88,7 @@ func TestContextWindowFireworks(t *testing.T) {
 		id   string
 		want int
 	}{
-		{"accounts/fireworks/models/glm-5p2", 1_000_000}, // was defaulting to 200K
+		{"accounts/fireworks/models/glm-5p2", 1_048_576}, // alias -> GLM 5.3 // was defaulting to 200K
 		{"accounts/fireworks/models/kimi-k3", 1_000_000}, // k3 ≠ the kimi-k2 262K case
 		{"accounts/fireworks/models/kimi-k3", 1_000_000},
 		{"accounts/fireworks/models/qwen3p8-max", 262_144},
@@ -92,7 +96,7 @@ func TestContextWindowFireworks(t *testing.T) {
 		{"accounts/fireworks/models/glm-5p3", 1_048_576},
 		{"accounts/fireworks/models/glm-5p3-flash", 1_048_576},
 		{"accounts/fireworks/models/deepseek-v4p1-flash", 1_048_576},
-		{"accounts/fireworks/models/deepseek-v4-pro-0813", 1_048_576},
+		{"accounts/fireworks/models/deepseek-v4-pro-0813", 1_048_576}, // alias -> V4.1 Flash
 		{"accounts/fireworks/models/deepseek-v4-flash-0731", 1_048_576},
 		{"gemini-3.1-pro-preview", 1_000_000},
 		{"gemini-3.8-flash", 1_000_000},
@@ -115,7 +119,7 @@ func TestModelPricingCacheRates(t *testing.T) {
 		{"grok-4.6", 0.5, 2.5},
 		{"claude-sonnet-5", 0.2, 2.5},
 		{"gpt-5.6-terra", 0.2, 2.5},
-		{"accounts/fireworks/models/glm-5p2", 0.14, 1.75},
+		{"accounts/fireworks/models/glm-5p2", 0.26, 1.75}, // alias -> GLM 5.3 cache rate
 		{"accounts/fireworks/models/kimi-k3", 0.30, 3.75},
 		// Qwen 3.8 Max publishes $0.25 cached, NOT the 0.1x default this used to inherit.
 		{"accounts/fireworks/models/qwen3p8-max", 0.25, 2.5},
@@ -123,7 +127,7 @@ func TestModelPricingCacheRates(t *testing.T) {
 		{"accounts/fireworks/models/glm-5p3", 0.26, 1.75},
 		{"accounts/fireworks/models/glm-5p3-flash", 0.03, 0.1875},
 		{"accounts/fireworks/models/deepseek-v4p1-flash", 0.007, 0.275},
-		{"accounts/fireworks/models/deepseek-v4-pro-0813", 0.044, 1.32 * 1.25},
+		{"accounts/fireworks/models/deepseek-v4-pro-0813", 0.007, 0.275}, // alias -> V4.1 Flash
 		{"accounts/fireworks/models/deepseek-v4-flash-0731", 0.007, 0.275},
 		{"gpt-image-2", 0.8, 10},
 	}
@@ -270,5 +274,39 @@ func TestMinReasoningEffort(t *testing.T) {
 	}
 	if got := MinReasoningEffort("some-model-nobody-added"); got != "" {
 		t.Errorf("unknown floor = %q, want \"\"", got)
+	}
+}
+
+// Aliases exist so a vendor decommission migrates pins instead of breaking them:
+// the retired name must resolve to the replacement entry, and a live label must
+// always win over an alias.
+func TestRetiredModelAliases(t *testing.T) {
+	for _, c := range []struct{ alias, wantID string }{
+		{"deepseek-v4-pro", "accounts/fireworks/models/deepseek-v4p1-flash"},
+		{"accounts/fireworks/models/deepseek-v4-pro-0813", "accounts/fireworks/models/deepseek-v4p1-flash"},
+		{"accounts/fireworks/models/deepseek-v4-flash-0731", "accounts/fireworks/models/deepseek-v4p1-flash"},
+		{"accounts/fireworks/models/deepseek-v4-flash-vision-exp", "accounts/fireworks/models/deepseek-v4p1-flash"},
+		{"glm-5p2", "accounts/fireworks/models/glm-5p3"},
+		{"accounts/fireworks/models/glm-5p2", "accounts/fireworks/models/glm-5p3"},
+	} {
+		m, ok := LookupModel(c.alias)
+		if !ok || m.ID != c.wantID {
+			t.Errorf("LookupModel(%q) = (%q, %v), want %q", c.alias, m.ID, ok, c.wantID)
+		}
+	}
+	// A live label resolves to itself, never to an alias entry.
+	if m, ok := LookupModel("glm-5p3"); !ok || m.ID != "accounts/fireworks/models/glm-5p3" {
+		t.Errorf("live label glm-5p3 = (%q, %v)", m.ID, ok)
+	}
+	// No alias may name a model that is still live — mustLoadModelCatalog panics
+	// on that, so this just pins the invariant for readers.
+	for _, m := range CatalogModels() {
+		for _, a := range m.Aliases {
+			for _, other := range CatalogModels() {
+				if other.ID == a || (other.Label != "" && other.Label == a) {
+					t.Errorf("alias %q on %q collides with live model %q", a, m.ID, other.ID)
+				}
+			}
+		}
 	}
 }

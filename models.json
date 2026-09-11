@@ -321,7 +321,7 @@
       "price_in": 1.4,
       "price_out": 4.4,
       "price_cache_read": 0.26,
-      "_note": "GLM-5.3 (Z.ai, Fireworks 2026-08-28). Supersedes GLM-5.2 as the pinnable GLM and as the Fireworks intra-lane fallback target. 743B params, 1M context, 131,072 max output, function calling, no vision; gains over 5.2 are post-training only. Official Standard-tier rate verified on the Fireworks model page 2026-09-11: $1.40 in / $0.26 cached / $4.40 out. Same headline price as 5.2, but the cached rate is nearly double, so it is declared explicitly.",
+      "_note": "GLM-5.3 (Z.ai, Fireworks 2026-08-28). Supersedes GLM-5.2 as the pinnable GLM and as the Fireworks intra-lane fallback target. 743B params, 1M context, 131,072 max output, function calling, no vision; gains over 5.2 are post-training only. Official Standard-tier rate verified on the Fireworks model page 2026-09-11: $1.40 in / $0.26 cached / $4.40 out. Same headline price as 5.2, but the cached rate is nearly double, so it is declared explicitly. Fireworks decommissions GLM 5.2 from serverless on 2026-09-25 and names 5.3 as its replacement, so 5.2's label and id are aliased here.",
       "pinnable": true,
       "group": "GLM",
       "desc": "Open-weight coding flagship",
@@ -335,6 +335,10 @@
       "fallback": [
         "terra",
         "luna"
+      ],
+      "aliases": [
+        "glm-5p2",
+        "accounts/fireworks/models/glm-5p2"
       ]
     },
     {
@@ -362,32 +366,6 @@
         "luna",
         "glm-5p3"
       ]
-    },
-    {
-      "id": "accounts/fireworks/models/glm-5p2",
-      "label": "glm-5p2",
-      "vendor": "fireworks",
-      "window": 1000000,
-      "vision": false,
-      "reasoning": true,
-      "_note": "GLM-5.2 (Z.ai, Fireworks 2026-06-17). SUPERSEDED by glm-5p3 2026-09-11 and demoted out of the pickers; still deployed on Fireworks, so the entry stays for anyone already pinned to it and to keep its metering exact. Official rate 2026-09-11: $1.40 / $0.14 cached / $4.40 \u2014 now declared here rather than inherited from the family floor. 1M context, function calling, no vision.",
-      "pinnable": false,
-      "group": "GLM",
-      "desc": "Open-weight coding flagship",
-      "name": "GLM-5.2",
-      "www": {
-        "chat": false,
-        "order": 30,
-        "description": "Open-weight coding flagship (Z.ai) with a 1M context window \u2014 the same cheap lane the memcode CLI runs on."
-      },
-      "max_output": 32000,
-      "fallback": [
-        "terra",
-        "glm-5p3"
-      ],
-      "price_in": 1.4,
-      "price_out": 4.4,
-      "price_cache_read": 0.14
     },
     {
       "id": "accounts/fireworks/models/qwen3p8-max",
@@ -457,39 +435,13 @@
       ]
     },
     {
-      "id": "accounts/fireworks/models/deepseek-v4-pro-0813",
-      "label": "deepseek-v4-pro",
-      "vendor": "fireworks",
-      "window": 1048576,
-      "vision": false,
-      "reasoning": true,
-      "_note": "DeepSeek V4 Pro 0813 (Fireworks official release, supersedes the earlier deepseek-v4-pro preview). Updated 2026-08-26 after Fireworks model page showed serverless Ready with path accounts/fireworks/models/deepseek-v4-pro-0813, 1,048,576 context (the value Fireworks /models reports; the entry previously said 1,040,000), function calling, $1.32/$3.96 per 1M, cached input $0.044. Label stays deepseek-v4-pro so existing pins keep following the latest Pro release.",
-      "pinnable": true,
-      "group": "DeepSeek",
-      "desc": "Open-weight reasoning",
-      "name": "DeepSeek V4 Pro",
-      "www": {
-        "chat": true,
-        "order": 25,
-        "description": "DeepSeek's official V4 Pro reasoning and coding model with a 1.04M context window."
-      },
-      "max_output": 32000,
-      "fallback": [
-        "terra",
-        "glm-5p3"
-      ],
-      "price_in": 1.32,
-      "price_out": 3.96,
-      "price_cache_read": 0.044
-    },
-    {
       "id": "accounts/fireworks/models/deepseek-v4p1-flash",
       "label": "deepseek-v4-flash",
       "vendor": "fireworks",
       "window": 1048576,
       "vision": true,
       "reasoning": true,
-      "_note": "DeepSeek V4.1 Flash (Fireworks serverless, 2026-09-10). Supersedes deepseek-v4-flash-0731. 1M context, function calling, and vision, which 0731 did not have. Price is unchanged from 0731 and verified on the Fireworks model page 2026-09-11: $0.22 in, $0.007 cached, $0.66 out.",
+      "_note": "DeepSeek V4.1 Flash (Fireworks serverless, 2026-09-10). 1M context, function calling, vision. Official rate 2026-09-11: $0.22 in, $0.007 cached, $0.66 out. Fireworks decommissions V4 Flash 0731, V4 Pro 0813 and V4 Flash Vision Exp from serverless on 2026-09-25 and names this model as the replacement for all three, so their labels and ids are aliased here and existing pins migrate instead of 400ing. Fireworks states V4.1 Flash outperforms V4 Pro 0813 on official benchmarks and carries the same vision capability as V4 Flash Vision Exp.",
       "pinnable": true,
       "group": "DeepSeek",
       "desc": "Fast reasoning",
@@ -506,7 +458,13 @@
       ],
       "price_in": 0.22,
       "price_out": 0.66,
-      "price_cache_read": 0.007
+      "price_cache_read": 0.007,
+      "aliases": [
+        "deepseek-v4-pro",
+        "accounts/fireworks/models/deepseek-v4-pro-0813",
+        "accounts/fireworks/models/deepseek-v4-flash-0731",
+        "accounts/fireworks/models/deepseek-v4-flash-vision-exp"
+      ]
     },
     {
       "id": "accounts/fireworks/models/minimax-m3",
@@ -685,7 +643,7 @@
       "price_in": 0.22,
       "price_out": 0.66,
       "price_cache_read": 0.007,
-      "_note": "Legacy deepseek-v4-flash-0731, superseded by deepseek-v4p1-flash but still deployed and still pinnable. Without this row it falls to the Fireworks floor and bills 6x its real rate. Does not match deepseek-v4p1-flash."
+      "_note": "Catches a drifted deepseek-v4-flash-* id that is not explicitly aliased. The 0731 build itself resolves through the alias on deepseek-v4p1-flash and prices there."
     },
     {
       "match": [
@@ -712,14 +670,6 @@
       "price_in": 1.4,
       "price_out": 4.4,
       "price_cache_read": 0.26
-    },
-    {
-      "match": [
-        "glm-5p2"
-      ],
-      "price_in": 1.4,
-      "price_out": 4.4,
-      "price_cache_read": 0.14
     },
     {
       "match": [

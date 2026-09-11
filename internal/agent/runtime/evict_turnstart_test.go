@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"github.com/memcode-ai/memcode/catalog"
 	"io"
 	"strings"
 	"testing"
@@ -84,8 +85,10 @@ func TestCompactBudgetFollowsWindow(t *testing.T) {
 	t.Setenv("MEMCODE_CONTEXT_SOFT_CAP", "")
 	s := &Session{out: io.Discard, turn: newTurnState(), planCtl: &plan.Controller{}, model: "glm-5p2"}
 
-	// Nothing learned → the MODEL's window governs (glm-5p2 = 1M → 800K).
-	if got, want := s.compactBudget(), 1_000_000*windowFallbackPct/100; got != want {
+	// Nothing learned → the MODEL's window governs. Derived from the catalog, not
+	// typed as a constant: a hardcoded window is the same absolute-number trap this
+	// test exists to prevent, and it broke when glm-5p2 became an alias for 5.3.
+	if got, want := s.compactBudget(), catalog.ContextWindow(s.model)*windowFallbackPct/100; got != want {
 		t.Fatalf("pre-learning budget = %d, want %d (window-relative)", got, want)
 	}
 	// Learned 1M lane (960K usable) → the lane governs: 816K, no built-in clip.
